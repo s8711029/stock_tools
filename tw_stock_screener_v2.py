@@ -718,29 +718,73 @@ _SLOT_ORDER = {"09:00": 1, "09:05": 1, "10:00": 2, "11:00": 3, "12:00": 4, "13:0
 
 def _fetch_slot_price(code, market="上市"):
     """抓股票即時/盤中現價：優先用 fast_info 即時成交價，備用小時線，再備用日線"""
+    tk_sym = _tw_ticker(code, market)
     try:
-        ticker = yf.Ticker(_tw_ticker(code, market))
+        ticker = yf.Ticker(tk_sym)
         # 1. 即時最後成交價（盤中最準）
-        lp = ticker.fast_info.get("last_price") or ticker.fast_info.get("lastPrice")
+        fi = ticker.fast_info
+        lp = (fi.get("last_price") if hasattr(fi, "get") else None) or getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None)
         if lp and lp > 0:
             return round(float(lp), 2)
     except Exception:
         pass
     try:
         # 2. 最新一根小時線收盤
-        df = ticker.history(period="5d", interval="60m")
+        df = yf.Ticker(tk_sym).history(period="5d", interval="60m")
         if not df.empty:
             return round(float(df["Close"].iloc[-1]), 2)
     except Exception:
         pass
     try:
         # 3. 日線收盤（最後備用）
-        df = ticker.history(period="2d", interval="1d")
+        df = yf.Ticker(tk_sym).history(period="2d", interval="1d")
         if not df.empty:
             return round(float(df["Close"].iloc[-1]), 2)
     except Exception:
         pass
     return None
+
+def _batch_fetch_prices(code_market_pairs):
+    """用 yf.download 批次抓多檔現價（比個別 Ticker 省大量 request）
+    回傳 {code: price} dict，失敗的 code 不放入結果。"""
+    pairs = list(code_market_pairs)
+    if not pairs:
+        return {}
+    code_by_sym = {_tw_ticker(code, market): code for code, market in pairs}
+    syms = list(code_by_sym.keys())
+    result = {}
+    for attempt in range(1, 4):
+        try:
+            import time as _t
+            if attempt > 1:
+                _t.sleep(3 * attempt)
+            df = yf.download(
+                syms, period="2d", interval="1d",
+                auto_adjust=True, progress=False, threads=True
+            )
+            if df.empty:
+                continue
+            # 單檔時 columns = ["Close", ...]; 多檔時 columns = MultiIndex (field, symbol)
+            if len(syms) == 1:
+                if "Close" in df.columns:
+                    val = df["Close"].dropna()
+                    if not val.empty and float(val.iloc[-1]) > 0:
+                        result[pairs[0][0]] = round(float(val.iloc[-1]), 2)
+            else:
+                close_df = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
+                for sym, code in code_by_sym.items():
+                    if sym in close_df.columns:
+                        try:
+                            val = close_df[sym].dropna()
+                            if not val.empty and float(val.iloc[-1]) > 0:
+                                result[code] = round(float(val.iloc[-1]), 2)
+                        except Exception:
+                            pass
+            if result:
+                break  # 有資料就不再重試
+        except Exception as e:
+            print(f"    [批次現價] 第 {attempt} 次失敗: {e}")
+    return result
 
 def sim_update(results, allow_entry=True):
     """根據最新分析結果更新模擬倉位（5個時段分開追蹤），回傳最新 sim dict。
@@ -773,21 +817,28 @@ def sim_update(results, allow_entry=True):
         save_sim(sim)
         return sim
 
-    # ── 預先批次抓所有持倉股的即時現價（並行） ──
+    # ── 預先批次抓所有持倉股的即時現價 ──
     all_open_codes = list({pos["code"] for pos in sim["open"]})
     _open_mkt_map  = {pos["code"]: pos.get("market", "上市") for pos in sim["open"]}
     slot_price_map = {}
     if all_open_codes:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(all_open_codes))) as pool:
-            futs = {pool.submit(_fetch_slot_price, c, _open_mkt_map.get(c, "上市")): c for c in all_open_codes}
-            for fut in concurrent.futures.as_completed(futs):
-                try:
-                    c = futs[fut]
-                    p = fut.result()
-                    if p is not None:
-                        slot_price_map[c] = p
-                except Exception:
-                    pass
+        # 優先用 yf.download 批次下載（省 request，不易觸發 rate limit）
+        pairs = [(c, _open_mkt_map.get(c, "上市")) for c in all_open_codes]
+        slot_price_map = _batch_fetch_prices(pairs)
+        # 批次失敗的個股，再用個別方式補抓
+        missing = [c for c in all_open_codes if c not in slot_price_map]
+        if missing:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(missing))) as pool:
+                futs = {pool.submit(_fetch_slot_price, c, _open_mkt_map.get(c, "上市")): c for c in missing}
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        c = futs[fut]
+                        p = fut.result()
+                        if p is not None:
+                            slot_price_map[c] = p
+                    except Exception:
+                        pass
+        print(f"    [持倉現價] 成功取得 {len(slot_price_map)}/{len(all_open_codes)} 檔現價")
 
     # ── 1. 出場：持滿 SIM_HOLD_DAYS 交易日，且當下時段 >= 進場時段 ──
     still_open = []
