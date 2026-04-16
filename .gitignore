@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 備份檔（已有 git 不需要）
+archive/
+
+# 輸出資料（不納入版控）
+../stock_reports/
+
+# 環境設定（含密碼，不上傳）
+../stock_email_config.json
+*.env
