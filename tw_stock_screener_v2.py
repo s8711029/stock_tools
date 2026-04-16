@@ -407,27 +407,32 @@ def fetch_twse_list():
 
 
 def fetch_tpex_list():
-    """抓取台灣上櫃股票清單（strMode=4）"""
-    try:
-        url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
-        r = requests.get(url, timeout=15, verify=False,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.encoding = "big5"
-        tables = pd.read_html(io.StringIO(r.text))
-        df = tables[0]
-        df.columns = df.iloc[0]
-        df = df.iloc[1:]
-        df = df[df.iloc[:, 0].str.match(r"^\d{4}\s", na=False)]
-        df["code"]   = df.iloc[:, 0].str.split().str[0]
-        df["name"]   = df.iloc[:, 0].str.split().str[1]
-        df["sector"] = df.iloc[:, 4].fillna("").astype(str).str.strip()
-        df = df[["code", "name", "sector"]].dropna(subset=["code","name"])
-        df = df[df["code"].str.len() == 4]
-        print(f"    共 {len(df)} 檔上櫃股票")
-        return df.reset_index(drop=True)
-    except Exception as e:
-        print(f"    [警告] 上櫃清單抓取失敗: {e}")
-        return pd.DataFrame(columns=["code","name","sector"])
+    """抓取台灣上櫃股票清單（strMode=4），失敗最多 retry 3 次"""
+    url = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, timeout=20, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.encoding = "big5"
+            tables = pd.read_html(io.StringIO(r.text))
+            df = tables[0]
+            df.columns = df.iloc[0]
+            df = df.iloc[1:]
+            df = df[df.iloc[:, 0].str.match(r"^\d{4}\s", na=False)]
+            df["code"]   = df.iloc[:, 0].str.split().str[0]
+            df["name"]   = df.iloc[:, 0].str.split().str[1]
+            df["sector"] = df.iloc[:, 4].fillna("").astype(str).str.strip()
+            df = df[["code", "name", "sector"]].dropna(subset=["code","name"])
+            df = df[df["code"].str.len() == 4]
+            if len(df) > 100:   # 正常應有 800+ 檔，< 100 視為異常
+                print(f"    共 {len(df)} 檔上櫃股票")
+                return df.reset_index(drop=True)
+            print(f"    [警告] 上櫃清單筆數異常（{len(df)} 檔），第 {attempt} 次重試...")
+        except Exception as e:
+            print(f"    [警告] 上櫃清單第 {attempt} 次抓取失敗: {e}")
+        import time as _time; _time.sleep(3 * attempt)
+    print("    [錯誤] 上櫃清單抓取失敗（已重試 3 次），本次略過上櫃掃描")
+    return pd.DataFrame(columns=["code","name","sector"])
 
 
 # ─────────────────────────────────────────────
@@ -1692,6 +1697,12 @@ def main():
     all_pairs  = list(zip(stock_list["code"], stock_list["name"],
                           stock_list["sector"], stock_list["market"]))
     total      = len(all_pairs)
+    n_twse     = len(stock_twse)
+    n_tpex     = len(stock_tpex)
+    if n_tpex == 0:
+        print(f"    [注意] 上櫃清單為空，本次僅掃描上市 {n_twse} 檔")
+    else:
+        print(f"    合計：上市 {n_twse} + 上櫃 {n_tpex} = {total} 檔")
 
     # ── 第一階段：日線快速掃描全部股票 ──────────────────
     print(f"[2/6] 第一階段：日線掃描全市場（上市+上櫃）{total} 檔（{MAX_WORKERS} 執行緒）...")
