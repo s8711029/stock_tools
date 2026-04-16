@@ -237,7 +237,7 @@ def analyze_weekly(stock):
     code  = stock["code"]
     name  = stock["name"]
     price = stock["price"]
-    ticker = code + ".TW"
+    ticker = code + (".TWO" if stock.get("market") == "上櫃" else ".TW")
 
     try:
         t  = yf.Ticker(ticker)

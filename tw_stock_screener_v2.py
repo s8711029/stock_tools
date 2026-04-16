@@ -581,6 +581,13 @@ def _detect_consolidation(df):
 
 
 # ─────────────────────────────────────────────
+# yfinance 代碼後綴：上市用 .TW，上櫃用 .TWO
+# ─────────────────────────────────────────────
+def _tw_ticker(code, market="上市"):
+    return code + (".TWO" if market == "上櫃" else ".TW")
+
+
+# ─────────────────────────────────────────────
 # 下載評分：日線 + 60分線
 # ─────────────────────────────────────────────
 def _fetch_daily_only(args):
@@ -591,7 +598,7 @@ def _fetch_daily_only(args):
 def _fetch_daily(code, name, sector, market="上市"):
     try:
         # 使用 Ticker.history() 取代 yf.download()，避免多執行緒共用 session 導致資料錯亂
-        ticker = yf.Ticker(code + ".TW")
+        ticker = yf.Ticker(_tw_ticker(code, market))
         df = ticker.history(period="6mo", interval="1d")
         ind = _calc_indicators(df)
         if not ind: return None
@@ -631,10 +638,10 @@ def _fetch_daily(code, name, sector, market="上市"):
     except:
         return None
 
-def _fetch_hourly(code):
+def _fetch_hourly(code, market="上市"):
     try:
         # 使用 Ticker.history() 取代 yf.download()，避免多執行緒共用 session 導致資料錯亂
-        ticker = yf.Ticker(code + ".TW")
+        ticker = yf.Ticker(_tw_ticker(code, market))
         df = ticker.history(period="60d", interval="60m")
         ind = _calc_indicators(df)
         if not ind: return None, None, 0
@@ -652,7 +659,7 @@ def _fetch_hourly(code):
 def _add_hourly(r):
     """第二階段：對已有日線結果的股票補上小時線評分"""
     code = r["code"]
-    h_score, h_signals, h_vol_ratio = _fetch_hourly(code)
+    h_score, h_signals, h_vol_ratio = _fetch_hourly(code, r.get("market", "上市"))
     if h_score is not None:
         r["h_score"]   = h_score
         r["h_signals"] = h_signals
@@ -709,10 +716,10 @@ def save_sim(sim):
 
 _SLOT_ORDER = {"09:00": 1, "09:05": 1, "10:00": 2, "11:00": 3, "12:00": 4, "13:00": 5, "13:20": 5}
 
-def _fetch_slot_price(code):
+def _fetch_slot_price(code, market="上市"):
     """抓股票即時/盤中現價：優先用 fast_info 即時成交價，備用小時線，再備用日線"""
     try:
-        ticker = yf.Ticker(code + ".TW")
+        ticker = yf.Ticker(_tw_ticker(code, market))
         # 1. 即時最後成交價（盤中最準）
         lp = ticker.fast_info.get("last_price") or ticker.fast_info.get("lastPrice")
         if lp and lp > 0:
@@ -768,10 +775,11 @@ def sim_update(results, allow_entry=True):
 
     # ── 預先批次抓所有持倉股的即時現價（並行） ──
     all_open_codes = list({pos["code"] for pos in sim["open"]})
+    _open_mkt_map  = {pos["code"]: pos.get("market", "上市") for pos in sim["open"]}
     slot_price_map = {}
     if all_open_codes:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(all_open_codes))) as pool:
-            futs = {pool.submit(_fetch_slot_price, c): c for c in all_open_codes}
+            futs = {pool.submit(_fetch_slot_price, c, _open_mkt_map.get(c, "上市")): c for c in all_open_codes}
             for fut in concurrent.futures.as_completed(futs):
                 try:
                     c = futs[fut]
@@ -853,10 +861,11 @@ def sim_update(results, allow_entry=True):
 
         # 批次抓新進場候選股的即時現價（並行）
         cand_codes = [r["code"] for r in candidates]
+        _cand_mkt_map = {r["code"]: r.get("market", "上市") for r in candidates}
         entry_slot_prices = {}
         if cand_codes:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(cand_codes))) as pool:
-                futs = {pool.submit(_fetch_slot_price, c): c for c in cand_codes}
+                futs = {pool.submit(_fetch_slot_price, c, _cand_mkt_map.get(c, "上市")): c for c in cand_codes}
                 for fut in concurrent.futures.as_completed(futs):
                     try:
                         c = futs[fut]
