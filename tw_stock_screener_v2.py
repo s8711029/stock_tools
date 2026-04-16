@@ -915,7 +915,7 @@ def sim_update(results, allow_entry=True):
     save_sim(sim)
     print(f"    模擬倉位 [{slot}]：今日新增 {new_count} 檔  持倉合計 {len(sim['open'])} 檔  累計出場 {len(sim['closed'])} 筆")
     if run_status == "no_qualify":
-        print(f"    ⚠️  [{slot}] 本時段無符合條件股票（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} 且量增≥{SIM_VOL_RATIO_MIN}x）")
+        print(f"    [注意] [{slot}] 本時段無符合條件股票（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} 且量增>={SIM_VOL_RATIO_MIN}x）")
     return sim
 
 def generate_sim_section(sim, for_email=False, split=False):
@@ -1639,6 +1639,9 @@ def send_email(cfg, results, html_path, today_str, run_time_str, market_open, si
         password  = cfg["sender_app_password"]
         receivers = _parse_recipients(cfg.get("recipient_email", "wic0935@gmail.com"))
 
+        if not results:
+            print("    [略過] 無分析結果，不寄送 Email")
+            return
         top1 = sorted(results, key=lambda x: x["combined"], reverse=True)[0]
         subject_str = f"[台股選股] {today_str} {run_time_str} - 第1名:{top1['code']}{top1['name']}({top1['combined']}分)"
 
