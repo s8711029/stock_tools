@@ -33,8 +33,9 @@ DAILY_DIR   = os.path.join(REPORT_DIR, "daily")
 HOURLY_DIR  = os.path.join(REPORT_DIR, "hourly")
 LATEST_HTML = os.path.join(REPORT_DIR, "latest.html")
 PREV_JSON   = os.path.join(REPORT_DIR, "prev_scores.json")
-SIM_JSON    = os.path.join(REPORT_DIR, "sim_trades.json")
-FUND_CACHE  = os.path.join(REPORT_DIR, "fundamental_cache.json")
+SIM_JSON       = os.path.join(REPORT_DIR, "sim_trades.json")
+FUND_CACHE     = os.path.join(REPORT_DIR, "fundamental_cache.json")
+WATCHLIST_JSON = os.path.join(REPORT_DIR, "candidate_watchlist.json")
 EMAIL_CFG   = os.path.join(DESKTOP, "stock_email_config.json")
 
 # ─────────────────────────────────────────────
@@ -1827,6 +1828,89 @@ def send_telegram(cfg, results, html_path, today_str, run_time_str):
 
 
 # ─────────────────────────────────────────────
+# 隔日進場價提醒
+# ─────────────────────────────────────────────
+def _suggested_entry(r):
+    """建議進場價：有支撐取支撐價，否則取昨收 -1%"""
+    if r.get("consol_flag") and r.get("consol_support", 0) > 0:
+        return round(r["consol_support"], 1), "支撐價"
+    return round(r["price"] * 0.99, 1), "昨收-1%"
+
+def save_candidate_watchlist(results, today_str, slot):
+    """排程執行後，將當次★可進場候選股存檔，供隔日09:05提醒用（每次覆寫）"""
+    candidates = []
+    for r in results:
+        if SIM_ENTRY_SCORE <= r["combined"] <= SIM_MAX_SCORE and r.get("vol_ratio", 0) >= SIM_VOL_RATIO_MIN:
+            ep, eb = _suggested_entry(r)
+            candidates.append({
+                "code":           r["code"],
+                "name":           r["name"],
+                "market":         r.get("market", "上市"),
+                "combined":       r["combined"],
+                "price":          r["price"],
+                "consol_flag":    r.get("consol_flag", False),
+                "consol_signal":  r.get("consol_signal", ""),
+                "suggested_entry": ep,
+                "entry_basis":    eb,
+            })
+    with open(WATCHLIST_JSON, "w", encoding="utf-8") as f:
+        json.dump({"date": today_str, "slot": slot, "candidates": candidates},
+                  f, ensure_ascii=False, indent=2)
+    print(f"    [候選股] 儲存 {len(candidates)} 支★可進場 → candidate_watchlist.json")
+
+def send_telegram_watchlist(cfg, today_str):
+    """09:05 時讀前日候選股存檔，發送建議進場價 Telegram（不影響原本兩則訊息）"""
+    if not os.path.exists(WATCHLIST_JSON):
+        return
+    try:
+        with open(WATCHLIST_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if data.get("date") == today_str:
+        return  # 同一天不送（避免重複）
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return
+
+    prev_date = data["date"]
+    lines = [f"📌 昨日({prev_date})候選股 今日建議進場價"]
+    for r in candidates:
+        mkt    = f"[{r['market']}] " if r.get("market") == "上櫃" else ""
+        consol = f"  ⚑{r['consol_signal']}" if r.get("consol_flag") else ""
+        lines.append(
+            f"  {mkt}{r['code']} {r['name']}  {r['combined']}分"
+            f"  昨收${r['price']}  建議進場:${r['suggested_entry']}({r['entry_basis']}){consol}"
+        )
+    text = "\n".join(lines)
+
+    import urllib.request, urllib.parse, ssl as _ssl
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
+
+    bots = cfg.get("telegram_bots") or []
+    if not bots:
+        t = cfg.get("telegram_bot_token", "")
+        c = cfg.get("telegram_chat_id", "")
+        if t and c:
+            bots = [{"token": t, "chat_id": c}]
+    for bot in bots:
+        token   = bot.get("token", "")
+        chat_id = bot.get("chat_id", "")
+        if not token or not chat_id:
+            continue
+        try:
+            enc = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+            urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=enc, timeout=15, context=_ctx)
+            print(f"    [候選股提醒] Telegram 已發送 -> chat_id:{chat_id}")
+        except Exception as e:
+            print(f"    [警告] 候選股提醒 Telegram 失敗 (chat_id:{chat_id}): {e}")
+
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 def main():
@@ -1962,6 +2046,14 @@ def main():
         send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
                    buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
         send_telegram(cfg, results, saved_path, today_str, run_time_str)
+        if is_scheduled:
+            _slot = ("09:05" if now.hour <= 9 else
+                     "10:00" if now.hour == 10 else
+                     "11:00" if now.hour == 11 else
+                     "12:00" if now.hour == 12 else "13:20")
+            save_candidate_watchlist(results, today_str, _slot)
+            if now.hour <= 9:
+                send_telegram_watchlist(cfg, today_str)
     else:
         print(f"      [提示] 未找到 {EMAIL_CFG}，跳過寄信")
 
