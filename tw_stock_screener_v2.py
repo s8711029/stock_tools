@@ -1859,7 +1859,7 @@ def save_candidate_watchlist(results, today_str, slot):
     print(f"    [候選股] 儲存 {len(candidates)} 支★可進場 → candidate_watchlist.json")
 
 def send_telegram_watchlist(cfg, today_str):
-    """09:05 時讀前日候選股存檔，發送建議進場價 Telegram（不影響原本兩則訊息）"""
+    """13:20 掃完後直接發送今日收盤候選股建議進場價（不影響原本兩則訊息）"""
     if not os.path.exists(WATCHLIST_JSON):
         return
     try:
@@ -1867,14 +1867,13 @@ def send_telegram_watchlist(cfg, today_str):
             data = json.load(f)
     except Exception:
         return
-    if data.get("date") == today_str:
-        return  # 同一天不送（避免重複）
+    if data.get("date") != today_str:
+        return  # 只發今日資料
     candidates = data.get("candidates", [])
     if not candidates:
         return
 
-    prev_date = data["date"]
-    lines = [f"📌 昨日({prev_date})候選股 今日建議進場價"]
+    lines = [f"📌 今日收盤候選股 明日建議進場價（{today_str}）"]
     for r in candidates:
         mkt    = f"[{r['market']}] " if r.get("market") == "上櫃" else ""
         consol = f"  ⚑{r['consol_signal']}" if r.get("consol_flag") else ""
@@ -2052,7 +2051,7 @@ def main():
                      "11:00" if now.hour == 11 else
                      "12:00" if now.hour == 12 else "13:20")
             save_candidate_watchlist(results, today_str, _slot)
-            if now.hour <= 9:
+            if now.hour >= 13:  # 13:20 最後一次掃描後發送
                 send_telegram_watchlist(cfg, today_str)
     else:
         print(f"      [提示] 未找到 {EMAIL_CFG}，跳過寄信")
