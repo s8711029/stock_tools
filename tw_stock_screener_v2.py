@@ -1386,6 +1386,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
           <td>{badge(r['h_score'],'h_score')}{diff_str(code,'h_score',r['h_score'])}<br>
               <span style="font-size:.75em;color:#666">{r['h_signals']}</span></td>
           <td>{badge(r['combined'])}{diff_str(code,'combined',r['combined'])}{entry_tag}</td>
+          <td style="font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
         </tr>"""
         return _rows
 
@@ -1448,7 +1449,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th>
 </tr>
 </thead>
 <tbody>{rows_twse}</tbody>
@@ -1460,7 +1461,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th>
 </tr>
 </thead>
 <tbody>{rows_tpex}</tbody>
@@ -1593,6 +1594,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
           <td style="{td}">{badge_cell(r['d_score'],55,35)}<br><span style="font-size:.78em;color:#666">{r['d_signals']}</span></td>
           <td style="{td}">{badge_cell(r['h_score'],55,35)}<br><span style="font-size:.78em;color:#666">{r['h_signals']}</span></td>
           <td style="{td}">{badge_cell(r['combined'])}{entry_tag}</td>
+          <td style="{td};font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
         </tr>"""
         return _rows
 
@@ -1638,7 +1640,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
   <th style="{th}">RSI</th><th style="{th}">KD</th>
   <th style="{th}">月營收YoY</th>
   <th style="{th}">日線(波段)</th><th style="{th}">60分線(短線)</th>
-  <th style="{th}">綜合分</th>
+  <th style="{th}">綜合分</th><th style="{th}">⚑整理</th>
 </tr></thead>"""
     return f"""<html>
 <head><meta charset="UTF-8"></head>
@@ -1724,6 +1726,104 @@ def send_email(cfg, results, html_path, today_str, run_time_str, market_open, si
         print(f"    email 已寄出 -> {', '.join(receivers)}（附件：{os.path.basename(html_path) if html_path else '無'}）")
     except Exception as e:
         print(f"    [警告] email 寄送失敗: {e}")
+
+
+def send_telegram(cfg, results, html_path, today_str, run_time_str):
+    import urllib.request, urllib.parse, ssl as _ssl
+
+    # 支援新格式 telegram_bots（陣列）或舊格式單組 token/chat_id
+    bots = cfg.get("telegram_bots") or []
+    if not bots:
+        t = cfg.get("telegram_bot_token", "")
+        c = cfg.get("telegram_chat_id", "")
+        if t and c:
+            bots = [{"token": t, "chat_id": c}]
+    if not bots:
+        return
+
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
+
+    def _can_enter(r):
+        return SIM_ENTRY_SCORE <= r["combined"] <= SIM_MAX_SCORE and r.get("vol_ratio", 0) >= SIM_VOL_RATIO_MIN
+
+    if results:
+        top_twse = sorted([r for r in results if r.get("market", "上市") == "上市"],
+                          key=lambda x: x["combined"], reverse=True)[:TOP_N]
+        top_tpex = sorted([r for r in results if r.get("market", "上市") == "上櫃"],
+                          key=lambda x: x["combined"], reverse=True)[:TOP_N]
+        top_all  = sorted(top_twse + top_tpex, key=lambda x: x["combined"], reverse=True)
+
+        top3 = top_all[:3]
+        lines = [f"📊 台股選股報告 {today_str} {run_time_str}"]
+        for i, r in enumerate(top3, 1):
+            entry = "★可進場 " if _can_enter(r) else ""
+            mkt = f"[{r.get('market','上市')}] " if r.get("market") == "上櫃" else ""
+            lines.append(f"{i}. {mkt}{r['code']} {r['name']}  {entry}{r['combined']}分  ${r['price']}")
+        text = "\n".join(lines)
+
+        # 重點注意：前10名中有 ★可進場 或 ⚑支撐整理 的股票
+        alert_lines = []
+        for r in top_all:
+            tags = []
+            if _can_enter(r):
+                tags.append("★可進場")
+            if r.get("consol_flag"):
+                tags.append(f"⚑{r.get('consol_signal','支撐整理')}")
+            if tags:
+                mkt = f"[{r.get('market','上市')}] "
+                alert_lines.append(f"  {mkt}{r['code']} {r['name']}  {r['combined']}分  ${r['price']}  {'  '.join(tags)}")
+        alert_text = f"🔔 重點注意 {today_str} {run_time_str}\n" + "\n".join(alert_lines) if alert_lines else None
+    else:
+        text = f"📊 台股選股 {today_str} {run_time_str} — 無選股結果"
+        alert_text = None
+
+    html_data = None
+    if html_path and os.path.exists(html_path):
+        with open(html_path, "rb") as f:
+            html_data = f.read()
+
+    for bot in bots:
+        token   = bot.get("token", "")
+        chat_id = bot.get("chat_id", "")
+        if not token or not chat_id:
+            continue
+        try:
+            # 文字訊息（摘要）
+            data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+            urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=data, timeout=15, context=_ctx)
+
+            # 額外提醒（可進場 / 支撐整理）
+            if alert_text:
+                adata = urllib.parse.urlencode({"chat_id": chat_id, "text": alert_text}).encode()
+                urllib.request.urlopen(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    data=adata, timeout=15, context=_ctx)
+
+            # HTML 附件
+            if html_data is not None:
+                boundary = "TGboundary"
+                fname = os.path.basename(html_path)
+                body = (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n'
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="document"; filename="{fname}"\r\n'
+                    f"Content-Type: text/html\r\n\r\n"
+                ).encode() + html_data + f"\r\n--{boundary}--\r\n".encode()
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{token}/sendDocument",
+                    data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                )
+                urllib.request.urlopen(req, timeout=30, context=_ctx)
+
+            print(f"    Telegram 已發送 -> chat_id:{chat_id}（附件：{os.path.basename(html_path) if html_path else '無'}）")
+        except Exception as e:
+            print(f"    [警告] Telegram 發送失敗 (chat_id:{chat_id}): {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1856,11 +1956,12 @@ def main():
             for r in buy_alerts_1300:
                 print(f"    {r['code']} {r['name']}  量比:{r['vol_ratio']}x  現價:{r['price']}")
 
-    print("      寄送 Email...")
+    print("      寄送 Email + Telegram...")
     cfg = load_email_cfg()
     if cfg:
         send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
                    buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
+        send_telegram(cfg, results, saved_path, today_str, run_time_str)
     else:
         print(f"      [提示] 未找到 {EMAIL_CFG}，跳過寄信")
 
