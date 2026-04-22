@@ -624,6 +624,7 @@ def _fetch_daily(code, name, sector, market="上市"):
             rsi=round(float(ind["r"]),1),
             k=round(float(ind["k"]),1), d=round(float(ind["d"]),1),
             macd_hist=round(float(ind["mch"]),4),
+            ma5=round(float(ind["m5"]),2),
             ma20=round(float(ind["m20"]),2),
             vol_ratio=round(float(ind["vol"]/ind["vma"]),2) if ind["vma"]>0 else 0,
             vol_lots=int(ind["vol"] / 1000),
@@ -715,7 +716,7 @@ def save_sim(sim):
     with open(SIM_JSON, "w", encoding="utf-8") as f:
         json.dump(sim, f, ensure_ascii=False, indent=2)
 
-_SLOT_ORDER = {"09:00": 1, "09:05": 1, "10:00": 2, "11:00": 3, "12:00": 4, "13:00": 5, "13:20": 5}
+_SLOT_ORDER = {"09:00": 1, "09:05": 1, "10:00": 2, "11:00": 3, "12:00": 4, "13:00": 5, "13:20": 5, "14:00": 6}
 
 def _fetch_slot_price(code, market="上市"):
     """抓股票即時/盤中現價：優先用 fast_info 即時成交價，備用小時線，再備用日線"""
@@ -744,6 +745,20 @@ def _fetch_slot_price(code, market="上市"):
     except Exception:
         pass
     return None
+
+def _fetch_ma5(code, market="上市"):
+    """抓個股最新5日均線（供持倉跌破判斷）"""
+    try:
+        ticker = yf.Ticker(_tw_ticker(code, market))
+        df = ticker.history(period="30d", interval="1d")
+        if df is None or len(df) < 5:
+            return None
+        close = df["Close"].squeeze()
+        ma5 = close.rolling(5).mean()
+        val = float(ma5.iloc[-1])
+        return round(val, 2) if val > 0 else None
+    except Exception:
+        return None
 
 def _batch_fetch_prices(code_market_pairs):
     """用 yf.download 批次抓多檔現價（比個別 Ticker 省大量 request）
@@ -793,12 +808,13 @@ def sim_update(results, allow_entry=True):
     now   = datetime.datetime.now()
     today = now.strftime("%Y-%m-%d")
     # 非交易時段（測試/補跑）仍記為最近合理時段
-    # 09:05 進場避免抓到前日收盤價；13:20 出場讓尾盤價格穩定
+    # 09:05 進場避免抓到前日收盤價；13:20 執行5MA跌破賣出；14:00 寄出推薦 Email
     if   now.hour <= 9:    slot = "09:05"
     elif now.hour == 10:   slot = "10:00"
     elif now.hour == 11:   slot = "11:00"
     elif now.hour == 12:   slot = "12:00"
-    else:                  slot = "13:20"
+    elif now.hour == 13:   slot = "13:20"
+    else:                  slot = "14:00"
 
     price_map = {r["code"]: r for r in results}
     sim = load_sim()
@@ -841,36 +857,70 @@ def sim_update(results, allow_entry=True):
                         pass
         print(f"    [持倉現價] 成功取得 {len(slot_price_map)}/{len(all_open_codes)} 檔現價")
 
-    # ── 1. 出場：持滿 SIM_HOLD_DAYS 交易日，且當下時段 >= 進場時段 ──
+    # ── 1. 出場：13:20 時段判斷收盤價是否跌破5日均線，是則賣出 ──
+    ma5_break_exits = []   # 本次因跌破5MA而出場的記錄，供 main() 寄通知信
     still_open = []
-    for pos in sim["open"]:
-        days_held  = _trading_days_between(pos["entry_date"], today)
-        entry_slot = pos.get("entry_slot", "09:05")
-        # 出場條件：持滿天數，且今天已到達進場時段（避免13:00進場在9:00被結算）
-        can_exit = (days_held >= SIM_HOLD_DAYS and
-                    _SLOT_ORDER.get(slot, 0) >= _SLOT_ORDER.get(entry_slot, 0))
 
-        # 即時現價優先，fallback 日線收盤，再 fallback 進場價
+    # 只在 13:20 時段進行5MA跌破判斷（盤中偏早，收盤前現價最穩定）
+    if slot == "13:20":
+        # 批次為持倉股補抓 ma5（若當次掃描未涵蓋）
+        ma5_cache = {}
+        for pos in sim["open"]:
+            code = pos["code"]
+            scan_ma5 = (price_map.get(code) or {}).get("ma5")
+            if scan_ma5:
+                ma5_cache[code] = scan_ma5
+        missing_ma5 = [pos["code"] for pos in sim["open"] if pos["code"] not in ma5_cache]
+        if missing_ma5:
+            _mkt_map2 = {pos["code"]: pos.get("market", "上市") for pos in sim["open"]}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(missing_ma5))) as pool:
+                futs2 = {pool.submit(_fetch_ma5, c, _mkt_map2.get(c, "上市")): c for c in missing_ma5}
+                for fut2 in concurrent.futures.as_completed(futs2):
+                    try:
+                        c2 = futs2[fut2]
+                        v2 = fut2.result()
+                        if v2:
+                            ma5_cache[c2] = v2
+                    except Exception:
+                        pass
+        print(f"    [5MA判斷] 已取得 {len(ma5_cache)}/{len(sim['open'])} 檔均線")
+
+    for pos in sim["open"]:
+        days_held = _trading_days_between(pos["entry_date"], today)
         curr_price = (slot_price_map.get(pos["code"])
                       or (price_map.get(pos["code"]) or {}).get("price")
                       or pos["entry_price"])
         ret_pct = round((curr_price - pos["entry_price"]) / pos["entry_price"] * 100, 2)
 
-        if can_exit:
-            sim["closed"].append({
+        # 跌破5MA出場（只在13:20判斷）
+        broke_5ma = False
+        ma5_val = None
+        if slot == "13:20":
+            ma5_val = ma5_cache.get(pos["code"])
+            if ma5_val and curr_price < ma5_val:
+                broke_5ma = True
+
+        if broke_5ma:
+            exit_rec = {
                 **{k: v for k, v in pos.items() if k not in ("curr_price", "curr_pct")},
-                "exit_date":  today,
-                "exit_slot":  slot,
-                "exit_price": curr_price,
-                "return_pct": ret_pct,
-                "days_held":  days_held,
-            })
+                "exit_date":   today,
+                "exit_slot":   slot,
+                "exit_price":  curr_price,
+                "return_pct":  ret_pct,
+                "days_held":   days_held,
+                "exit_reason": "5MA_break",
+                "ma5_at_exit": ma5_val,
+            }
+            sim["closed"].append(exit_rec)
+            ma5_break_exits.append(exit_rec)
         else:
             pos["curr_price"] = curr_price
             pos["curr_pct"]   = ret_pct
             pos["days_held"]  = days_held
             still_open.append(pos)
+
     sim["open"] = still_open
+    sim["last_5ma_exits"] = ma5_break_exits  # 供 main() 讀取後寄通知信
 
     # ── 2. 新進場：只在排程觸發時開倉（手動執行跳過） ──
     new_count = 0
@@ -982,7 +1032,7 @@ def generate_sim_section(sim, for_email=False, split=False):
 
     closed = [p for p in sim.get("closed", []) if not _is_holiday_entry(p)]
     opened = [p for p in sim.get("open",   []) if not _is_holiday_entry(p)]
-    SLOTS  = ["09:00", "09:05", "10:00", "11:00", "12:00", "13:00", "13:20"]
+    SLOTS  = ["09:00", "09:05", "10:00", "11:00", "12:00", "13:00", "13:20", "14:00"]
     _ls    = "font-size:.74em;padding:1px 4px;border-radius:2px;text-decoration:none;margin:1px;display:inline-block;color:#fff"
 
     def ret_col(v): return "#c0392b" if v > 0 else ("#27ae60" if v < 0 else "#555")
@@ -1169,7 +1219,7 @@ function _simSort(tblId, col) {
 </script>"""
 
     wrap_open  = '<div style="margin:12px 0;background:#fff;border:1px solid #b8c8d8;border-radius:6px;padding:10px 14px">' if for_email else '<details open style="margin:12px 0;background:#fff;border:1px solid #b8c8d8;border-radius:6px;padding:10px 14px">'
-    wrap_title = '' if for_email else f'<summary style="font-weight:bold;color:#1a5276;font-size:1em;cursor:pointer">模擬下單 — 5時段進場比較（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} / 量增≥{SIM_VOL_RATIO_MIN}x / 跳過{"/".join(SIM_SKIP_SLOTS)} / {SIM_HOLD_DAYS}日出場）</summary>'
+    wrap_title = '' if for_email else f'<summary style="font-weight:bold;color:#1a5276;font-size:1em;cursor:pointer">模擬下單 — 5時段進場比較（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} / 量增≥{SIM_VOL_RATIO_MIN}x / 跳過{"/".join(SIM_SKIP_SLOTS)} / 跌破5MA出場）</summary>'
     wrap_close = '</div>' if for_email else '</details>'
     sort_hint  = "" if for_email else "（點欄位標題可排序）"
     closed_label = "已出場明細（全部）" if for_email else "已出場明細（全部，點欄位標題可排序）"
@@ -1729,6 +1779,64 @@ def send_email(cfg, results, html_path, today_str, run_time_str, market_open, si
         print(f"    [警告] email 寄送失敗: {e}")
 
 
+def send_5ma_break_email(cfg, exits, today_str, run_time_str):
+    """寄出跌破5日均線賣出通知信"""
+    try:
+        sender    = cfg["sender_email"]
+        password  = cfg["sender_app_password"]
+        receivers = _parse_recipients(cfg.get("recipient_email", "wic0935@gmail.com"))
+
+        subject = f"[台股] 跌破5日均線賣出通知 {today_str} {run_time_str}"
+
+        rows_html = ""
+        for p in exits:
+            ret = p.get("return_pct", 0)
+            ret_color = "#c0392b" if ret < 0 else "#27ae60"
+            rows_html += f"""
+<tr>
+  <td style="padding:6px 10px;border:1px solid #ddd">{p.get('name','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{p.get('code','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{p.get('entry_date','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('entry_price','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('exit_price','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('ma5_at_exit','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right;color:{ret_color};font-weight:bold">{ret:+.2f}%</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{today_str} {run_time_str}</td>
+</tr>"""
+
+        body = f"""<html><body style="font-family:Arial,sans-serif;font-size:14px">
+<h2 style="color:#c0392b">⚠️ 跌破5日均線賣出通知</h2>
+<p>以下持倉於 {today_str} {run_time_str} 因收盤價跌破5日均線，已自動賣出：</p>
+<table style="border-collapse:collapse;width:100%">
+<thead><tr style="background:#1a5276;color:#fff">
+  <th style="padding:7px 10px;border:1px solid #1a5276">股票名稱</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">代號</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">買入日期</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">買入價格</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">今日收盤價</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">5日均線</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">報酬率</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">賣出日期及時間</th>
+</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</body></html>"""
+
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"]    = sender
+        msg["To"]      = ", ".join(receivers)
+        msg.attach(MIMEText(body, "html", "utf-8"))
+
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
+            s.login(sender, password)
+            s.send_message(msg)
+        print(f"    [5MA賣出通知] email 已寄出 -> {', '.join(receivers)}")
+    except Exception as e:
+        print(f"    [警告] 5MA賣出通知 email 失敗: {e}")
+
+
 def send_telegram(cfg, results, html_path, today_str, run_time_str):
     import urllib.request, urllib.parse, ssl as _ssl
 
@@ -2026,35 +2134,54 @@ def main():
     html       = generate_html(results, prev_map, today_str, market_open, run_time_str, sim)
     saved_path = save_reports(html, now)
 
-    # ── 13:00 收盤買入提醒 ──────────────────────────
+    # ── 時段計算（供後續 Email / Telegram 分支使用） ──
+    _cur_slot = ("09:05" if now.hour <= 9 else
+                 "10:00" if now.hour == 10 else
+                 "11:00" if now.hour == 11 else
+                 "12:00" if now.hour == 12 else
+                 "13:20" if now.hour == 13 else "14:00")
+
+    # ── 13:20：收盤買入提醒 + 跌破5MA賣出通知 ──────────
     buy_alerts_1300 = []
     if now.hour == 13:
         for r in results:
-            vol_r = r.get("vol_ratio", 0)
+            vol_r  = r.get("vol_ratio", 0)
             is_red = r.get("price", 0) > r.get("open_price", r.get("price", 0))
             if vol_r >= 2.0 and is_red and r.get("combined", 0) >= 50:
                 buy_alerts_1300.append(r)
         if buy_alerts_1300:
-            print(f"\n🔔 [13:20提醒] 共 {len(buy_alerts_1300)} 檔觸發買入訊號（量>2x+紅K+分>=50）")
+            print(f"\n[13:20提醒] 共 {len(buy_alerts_1300)} 檔觸發買入訊號（量>2x+紅K+分>=50）")
             for r in buy_alerts_1300:
                 print(f"    {r['code']} {r['name']}  量比:{r['vol_ratio']}x  現價:{r['price']}")
 
-    print("      寄送 Email + Telegram...")
     cfg = load_email_cfg()
-    if cfg:
-        send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
-                   buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
-        send_telegram(cfg, results, saved_path, today_str, run_time_str)
-        if is_scheduled:
-            _slot = ("09:05" if now.hour <= 9 else
-                     "10:00" if now.hour == 10 else
-                     "11:00" if now.hour == 11 else
-                     "12:00" if now.hour == 12 else "13:20")
-            save_candidate_watchlist(results, today_str, _slot)
-            if now.hour >= 13:  # 13:20 最後一次掃描後發送
-                send_telegram_watchlist(cfg, today_str)
+
+    # ── 13:20：寄出跌破5MA賣出通知（如有） ──────────────
+    if now.hour == 13 and cfg:
+        ma5_exits = sim.get("last_5ma_exits", [])
+        if ma5_exits:
+            print(f"    [5MA賣出] 本次共 {len(ma5_exits)} 檔跌破5MA，寄出通知...")
+            send_5ma_break_email(cfg, ma5_exits, today_str, run_time_str)
+        else:
+            print("    [5MA賣出] 本次無持倉跌破5日均線")
+
+    # ── 14:00：寄出選股推薦 Email + Telegram ─────────────
+    if now.hour >= 14:
+        print("    [14:00] 寄送選股推薦 Email + Telegram...")
+        if cfg:
+            send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
+                       buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
+            send_telegram(cfg, results, saved_path, today_str, run_time_str)
+        else:
+            print(f"    [提示] 未找到 {EMAIL_CFG}，跳過寄信")
     else:
-        print(f"      [提示] 未找到 {EMAIL_CFG}，跳過寄信")
+        print(f"    [{_cur_slot}] 非14:00時段，略過推薦 Email（14:00排程執行時寄送）")
+
+    # ── 儲存候選名單 / 隔日進場價 Telegram ──────────────
+    if is_scheduled and cfg:
+        save_candidate_watchlist(results, today_str, _cur_slot)
+        if now.hour >= 13:
+            send_telegram_watchlist(cfg, today_str)
 
     print(f"\n[完成] 報告資料夾: {REPORT_DIR}")
 
