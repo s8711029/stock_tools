@@ -101,8 +101,10 @@ def _analyze_support_ma(code, market, name):
                 if ma_val <= 0:
                     continue
                 low_val = float(low.iloc[i])
-                # 觸碰條件：當日低點距均線 <= TOUCH_PCT，且收盤在均線附近（未跌穿太深）
-                if low_val <= ma_val * (1 + TOUCH_PCT) and float(close.iloc[i]) >= ma_val * (1 - TOUCH_PCT):
+                # 觸碰條件：低點進入均線 ±TOUCH_PCT 帶（排除遠離均線的暴跌）且收盤收回均線附近
+                if (low_val >= ma_val * (1 - TOUCH_PCT) and
+                        low_val <= ma_val * (1 + TOUCH_PCT) and
+                        float(close.iloc[i]) >= ma_val * (1 - TOUCH_PCT)):
                     touch_count += 1
                     # 量能條件：觸碰日成交量 >= 0.8 倍 20MA
                     vol = float(volume.iloc[i])
@@ -128,16 +130,23 @@ def _analyze_support_ma(code, market, name):
                     "ma_value":     round(float(ma.iloc[-1]), 2),
                 }
 
-        if not results_by_ma:
-            return {
-                "code": code, "name": name, "market": market,
-                "current_price": current_price,
-                "support_ma": None, "ma_label": "暫無符合之均線",
-                "ma_value": None, "success_rate": None,
-                "vol_relation": "—", "suggestion": "觀察",
-            }
+        _no_support = {
+            "code": code, "name": name, "market": market,
+            "current_price": current_price,
+            "support_ma": None, "ma_label": "暫無符合之均線",
+            "ma_value": None, "success_rate": None,
+            "vol_relation": "—", "suggestion": "觀察",
+        }
 
-        # 找出 bounce_count 最多的均線；若相同則取更長週期（慣性更顯著）
+        if not results_by_ma:
+            return _no_support
+
+        # 各均線反彈次數全部相同 → 無法判斷慣性支撐，標示為暫無
+        all_bounces = [v["bounces"] for v in results_by_ma.values()]
+        if len(results_by_ma) > 1 and len(set(all_bounces)) == 1:
+            return _no_support
+
+        # 找出 bounce_count 最多的均線；唯一最高者才算慣性支撐
         best_period = max(
             results_by_ma,
             key=lambda p: (results_by_ma[p]["bounces"], p)

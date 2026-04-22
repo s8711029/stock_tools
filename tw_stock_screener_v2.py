@@ -2180,7 +2180,7 @@ def main():
     # ── 儲存候選名單 / 隔日進場價 Telegram ──────────────
     if is_scheduled and cfg:
         save_candidate_watchlist(results, today_str, _cur_slot)
-        if now.hour >= 13:
+        if now.hour == 13:  # 只在13:20排程發送（避免14:00重複發送）
             send_telegram_watchlist(cfg, today_str)
 
     print(f"\n[完成] 報告資料夾: {REPORT_DIR}")
