@@ -96,12 +96,17 @@ def _analyze_support_ma(code, market, name):
             bounce_count  = 0
             vol_ok_count  = 0
 
-            for i in range(period, len(close) - BOUNCE_DAYS):
-                ma_val = float(ma.iloc[i])
-                if ma_val <= 0:
+            for i in range(period + 1, len(close) - BOUNCE_DAYS):
+                ma_val      = float(ma.iloc[i])
+                ma_val_prev = float(ma.iloc[i - 1])
+                if ma_val <= 0 or ma_val_prev <= 0:
                     continue
-                low_val = float(low.iloc[i])
-                # 觸碰條件：低點進入均線 ±TOUCH_PCT 帶（排除遠離均線的暴跌）且收盤收回均線附近
+                low_val    = float(low.iloc[i])
+                prev_close = float(close.iloc[i - 1])
+                # 必要前提：前一日收盤在均線之上（確保是從上方回落、非已跌破後震盪）
+                if prev_close < ma_val_prev:
+                    continue
+                # 觸碰條件：當日低點進入均線 ±TOUCH_PCT 帶，且收盤未跌破均線太深
                 if (low_val >= ma_val * (1 - TOUCH_PCT) and
                         low_val <= ma_val * (1 + TOUCH_PCT) and
                         float(close.iloc[i]) >= ma_val * (1 - TOUCH_PCT)):
