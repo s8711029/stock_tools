@@ -1837,6 +1837,49 @@ def send_5ma_break_email(cfg, exits, today_str, run_time_str):
         print(f"    [警告] 5MA賣出通知 email 失敗: {e}")
 
 
+def send_telegram_5ma_break(cfg, exits, today_str, run_time_str):
+    """發送跌破5日均線賣出通知到 Telegram"""
+    import urllib.request, urllib.parse, ssl as _ssl
+
+    bots = cfg.get("telegram_bots") or []
+    if not bots:
+        t = cfg.get("telegram_bot_token", "")
+        c = cfg.get("telegram_chat_id", "")
+        if t and c:
+            bots = [{"token": t, "chat_id": c}]
+    if not bots:
+        return
+
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
+
+    lines = [f"⚠️ 跌破5MA賣出通知 {today_str} {run_time_str}"]
+    for p in exits:
+        ret = p.get("return_pct", 0)
+        sign = "+" if ret >= 0 else ""
+        lines.append(
+            f"  {p.get('code','')} {p.get('name','')}  "
+            f"買:{p.get('entry_price','')} 出:{p.get('exit_price','')} "
+            f"5MA:{p.get('ma5_at_exit','')}  {sign}{ret:.2f}%"
+        )
+    text = "\n".join(lines)
+
+    for bot in bots:
+        token   = bot.get("token", "")
+        chat_id = bot.get("chat_id", "")
+        if not token or not chat_id:
+            continue
+        try:
+            data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+            urllib.request.urlopen(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data=data, timeout=15, context=_ctx)
+            print(f"    [5MA賣出通知] TG bot {chat_id} 已發送")
+        except Exception as e:
+            print(f"    [警告] 5MA賣出通知 TG 失敗: {e}")
+
+
 def send_telegram(cfg, results, html_path, today_str, run_time_str):
     import urllib.request, urllib.parse, ssl as _ssl
 
@@ -2162,20 +2205,17 @@ def main():
         if ma5_exits:
             print(f"    [5MA賣出] 本次共 {len(ma5_exits)} 檔跌破5MA，寄出通知...")
             send_5ma_break_email(cfg, ma5_exits, today_str, run_time_str)
+            send_telegram_5ma_break(cfg, ma5_exits, today_str, run_time_str)
         else:
             print("    [5MA賣出] 本次無持倉跌破5日均線")
 
-    # ── 14:00：寄出選股推薦 Email + Telegram ─────────────
-    if now.hour >= 14:
-        print("    [14:00] 寄送選股推薦 Email + Telegram...")
-        if cfg:
-            send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
-                       buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
-            send_telegram(cfg, results, saved_path, today_str, run_time_str)
-        else:
-            print(f"    [提示] 未找到 {EMAIL_CFG}，跳過寄信")
-    else:
-        print(f"    [{_cur_slot}] 非14:00時段，略過推薦 Email（14:00排程執行時寄送）")
+    # ── 每次排程：寄出選股推薦 Email + Telegram ─────────
+    if is_scheduled and cfg:
+        send_email(cfg, results, saved_path, today_str, run_time_str, market_open, sim,
+                   buy_alerts=buy_alerts_1300 if buy_alerts_1300 else None)
+        send_telegram(cfg, results, saved_path, today_str, run_time_str)
+    elif not cfg:
+        print(f"    [提示] 未找到 {EMAIL_CFG}，跳過寄信")
 
     # ── 儲存候選名單 / 隔日進場價 Telegram ──────────────
     if is_scheduled and cfg:
