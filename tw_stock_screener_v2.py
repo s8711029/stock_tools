@@ -17,6 +17,7 @@ from email               import encoders
 from email.header        import Header
 import requests, io
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import ta
 import concurrent.futures
@@ -589,6 +590,119 @@ def _tw_ticker(code, market="上市"):
 
 
 # ─────────────────────────────────────────────
+# 回塑性分析買點規則（2026-05-12 retro_analysis 衍生）
+# ─────────────────────────────────────────────
+def _retro_check(df):
+    """套用 4 條買點規則 + 起漲前型態
+    輸入：6 個月日線 df（Open/High/Low/Close/Volume 大寫欄位）
+    回傳：{signal, price, pattern, level}
+      level: gold(🏆) / today(✓) / retest(📉) / none(—)
+    """
+    try:
+        if df is None or len(df) < 30:
+            return {"signal": "—", "price": None, "pattern": "資料不足", "level": "none"}
+        close  = df["Close"].astype(float).values
+        open_  = df["Open"].astype(float).values
+        high   = df["High"].astype(float).values
+        low    = df["Low"].astype(float).values
+        volume = df["Volume"].astype(float).values
+        n = len(close)
+
+        cs = pd.Series(close)
+        ma5  = cs.rolling(5).mean().values
+        ma10 = cs.rolling(10).mean().values
+        ma20 = cs.rolling(20).mean().values
+        vma20 = pd.Series(volume).rolling(20).mean().values
+        lo9 = pd.Series(low).rolling(9).min().values
+        hi9 = pd.Series(high).rolling(9).max().values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rsv = np.where(hi9 - lo9 > 0, (close - lo9) / (hi9 - lo9) * 100, 50.0)
+        rsv = np.nan_to_num(rsv, nan=50.0)
+        k = np.zeros(n); d = np.zeros(n); k[0] = 50.0; d[0] = 50.0
+        for i in range(1, n):
+            k[i] = (2/3) * k[i-1] + (1/3) * float(rsv[i])
+            d[i] = (2/3) * d[i-1] + (1/3) * k[i]
+
+        def trig_at(i):
+            if i < 20 or np.isnan(ma5[i]) or np.isnan(ma20[i]) or np.isnan(vma20[i]):
+                return []
+            out = []
+            # ① 量縮整理 ≥3 日後爆量站 5MA
+            if i >= 3:
+                v3, vm3 = volume[i-3:i], vma20[i-3:i]
+                if not np.isnan(vm3).any() and (v3 < vm3).all():
+                    if volume[i] > vma20[i] * 1.8 and close[i] > open_[i] and close[i] > ma5[i]:
+                        out.append("①量縮後爆量")
+            # ② KD<20 黃金交叉 + 站上 10MA
+            if i >= 1 and not np.isnan(ma10[i]):
+                if k[i-1] < 20 and k[i-1] < d[i-1] and k[i] > d[i] and close[i] > ma10[i]:
+                    out.append("②KD低檔交叉")
+            # ③ 縮量回測 20MA 不破紅K（前 5 日有破過）
+            if i >= 5:
+                p5_lo = low[i-5:i]; p5_m20 = ma20[i-5:i]
+                broke = any((not np.isnan(m)) and (l < m) for l, m in zip(p5_lo, p5_m20))
+                if broke and low[i] >= ma20[i] * 0.98 and close[i] > open_[i] and volume[i] < vma20[i]:
+                    out.append("③回測20MA不破")
+            # ④ 突破近 20 日高點 + 量增
+            if i >= 20:
+                recent_hi = float(np.max(high[i-20:i]))
+                if close[i] > recent_hi and volume[i] > vma20[i] * 1.5 and close[i] > open_[i]:
+                    out.append("④突破20日高")
+            return out
+
+        # 起漲前型態（今日往前 20 日）
+        i = n - 1
+        pat = "其他"
+        pre_hi = float(np.max(high[max(0,i-20):i]))
+        pre_lo = float(np.min(low[max(0,i-20):i]))
+        ct = float(close[i])
+        if pre_lo > 0:
+            range_pct = (pre_hi - pre_lo) / pre_lo * 100
+            top60 = float(np.max(high[max(0,i-60):i])) if i >= 30 else 0
+            if top60 > 0 and (top60 - ct) / top60 > 0.20:
+                pat = "跌深反彈"
+            elif range_pct < 15 and ct >= pre_hi * 0.99:
+                pat = "箱型突破"
+            elif range_pct > 15 and (ct - pre_lo) / pre_lo * 100 > 5:
+                pat = "W底/V反"
+            elif (not np.isnan(ma20[i]) and not np.isnan(ma20[max(0,i-5)])
+                  and ma20[i] > ma20[max(0,i-5)]
+                  and low[i-1] <= ma20[i] * 1.03 and ct > ma20[i]):
+                pat = "多頭續攻回測"
+
+        # 今日訊號
+        today_trig = trig_at(n - 1)
+        if today_trig:
+            rule = today_trig[0]
+            price = round(float(close[-1]), 2)
+            if pat == "W底/V反":
+                return {"signal": f"🏆{rule}@${price}", "price": price, "pattern": pat, "level": "gold"}
+            return {"signal": f"✓{rule}@${price}", "price": price, "pattern": pat, "level": "today"}
+
+        # 回看 30 天找更低觸發點
+        today_close = float(close[-1])
+        best = None
+        start = max(20, n - 1 - 30)
+        for j in range(start, n - 1):
+            trig = trig_at(j)
+            if trig and float(close[j]) < today_close:
+                if best is None or float(close[j]) < best[2]:
+                    best = (j, trig[0], float(close[j]))
+        if best is not None:
+            idx, rule, price = best
+            try:
+                date_str = pd.Timestamp(df.index[idx]).strftime("%m/%d")
+            except Exception:
+                date_str = "?"
+            return {"signal": f"📉等${price:.2f}({date_str}){rule}",
+                    "price": round(price, 2), "pattern": pat, "level": "retest"}
+
+        return {"signal": "—", "price": None, "pattern": pat, "level": "none"}
+    except Exception:
+        return {"signal": "—", "price": None, "pattern": "?", "level": "none"}
+
+
+# ─────────────────────────────────────────────
 # 下載評分：日線 + 60分線
 # ─────────────────────────────────────────────
 def _fetch_daily_only(args):
@@ -615,6 +729,7 @@ def _fetch_daily(code, name, sector, market="上市"):
         wchg  = (ind["c"]-close.iloc[-6]) /close.iloc[-6] *100 if len(close)>=6  else 0
         mchg  = (ind["c"]-close.iloc[-22])/close.iloc[-22]*100 if len(close)>=22 else 0
         day_chg = round((ind["c"] - ind["c1"]) / ind["c1"] * 100, 2) if ind["c1"] > 0 else 0
+        retro = _retro_check(df)
         return dict(
             code=code, name=name, sector=sector, market=market,
             price=round(float(ind["c"]),2),
@@ -636,6 +751,8 @@ def _fetch_daily(code, name, sector, market="上市"):
             foreign_net=None, trust_net=None,
             consec_foreign=0, consec_trust=0,
             foreign_flag=False, trust_flag=False,
+            retro_signal=retro["signal"], retro_price=retro["price"],
+            retro_pattern=retro["pattern"], retro_level=retro["level"],
         )
     except:
         return None
@@ -760,6 +877,84 @@ def _fetch_ma5(code, market="上市"):
     except Exception:
         return None
 
+def _fetch_sell_data(code, market="上市"):
+    """抓取13:20賣出訊號所需資料：ma5, vol_ma20, prev_close, open_today, high_today, vol_today"""
+    try:
+        ticker = yf.Ticker(_tw_ticker(code, market))
+        df_d = ticker.history(period="35d", interval="1d")
+        if df_d is None or len(df_d) < 6:
+            return None
+        close_d  = df_d["Close"].squeeze()
+        vol_d    = df_d["Volume"].squeeze()
+        ma5      = float(close_d.rolling(5).mean().iloc[-1])
+        vol_ma20 = (float(vol_d.rolling(20).mean().iloc[-1])
+                    if len(vol_d) >= 20 else float(vol_d.mean()))
+
+        # 前日收盤（排除今日不完整的日線 bar）
+        today_dt = datetime.date.today()
+        dates = [d.date() if hasattr(d, "date") else d for d in df_d.index]
+        prev_closes = [float(close_d.iloc[i]) for i, d in enumerate(dates) if d < today_dt]
+        prev_close  = prev_closes[-1] if prev_closes else float(close_d.iloc[-1])
+
+        # 今日盤中資料（1 小時線）
+        df_h = ticker.history(period="1d", interval="60m")
+        open_today = high_today = vol_today = None
+        if df_h is not None and not df_h.empty:
+            open_today = float(df_h["Open"].iloc[0])
+            high_today = float(df_h["High"].max())
+            vol_today  = float(df_h["Volume"].sum())
+
+        return {
+            "ma5":        round(ma5, 2),
+            "vol_ma20":   round(vol_ma20, 0),
+            "prev_close": round(prev_close, 2),
+            "open_today": round(open_today, 2) if open_today else None,
+            "high_today": round(high_today, 2) if high_today else None,
+            "vol_today":  vol_today,
+        }
+    except Exception:
+        return None
+
+
+def _check_sell_signals(sd, curr_price):
+    """
+    三條件賣出判斷（任一觸發即納入，回傳已觸發的理由清單）。
+    sd = _fetch_sell_data() 回傳 dict；curr_price = 最新現價。
+    """
+    if not sd or not curr_price:
+        return []
+
+    ma5       = sd["ma5"]
+    vol_ma20  = sd["vol_ma20"]
+    prev_close = sd["prev_close"]
+    open_today = sd.get("open_today")
+    high_today = sd.get("high_today")
+    vol_today  = sd.get("vol_today")
+
+    reasons = []
+    daily_chg = (curr_price - prev_close) / prev_close if prev_close > 0 else 0
+    vol_ratio  = vol_today / vol_ma20 if (vol_today and vol_ma20 > 0) else 0
+    bias_5ma   = (curr_price - ma5) / ma5 if ma5 > 0 else 0
+
+    # 條件1：爆量滯漲（量 > 2.5x 20MA均量，且漲幅 < 1%）
+    if vol_ratio >= 2.5 and daily_chg < 0.01:
+        reasons.append(f"爆量滯漲(量{vol_ratio:.1f}x,漲{daily_chg*100:.1f}%)")
+
+    # 條件2：避雷針（上影線 > 2x實體，且正乖離 > 10%）
+    if open_today and high_today:
+        body       = abs(curr_price - open_today)
+        upper_shad = high_today - max(curr_price, open_today)
+        if body > 0 and upper_shad > 2 * body and bias_5ma > 0.10:
+            reasons.append(
+                f"避雷針(上影{upper_shad:.1f}/實體{body:.1f},乖離{bias_5ma*100:.1f}%)")
+
+    # 條件3：大黑K + 跌破5MA（跌幅 > 4% 且 收盤 < 5MA）
+    if daily_chg < -0.04 and curr_price < ma5:
+        reasons.append(f"大黑K(跌{abs(daily_chg)*100:.1f}%,跌破5MA)")
+
+    return reasons
+
+
 def _batch_fetch_prices(code_market_pairs):
     """用 yf.download 批次抓多檔現價（比個別 Ticker 省大量 request）
     回傳 {code: price} dict，失敗的 code 不放入結果。"""
@@ -808,7 +1003,7 @@ def sim_update(results, allow_entry=True):
     now   = datetime.datetime.now()
     today = now.strftime("%Y-%m-%d")
     # 非交易時段（測試/補跑）仍記為最近合理時段
-    # 09:05 進場避免抓到前日收盤價；13:20 執行5MA跌破賣出；14:00 寄出推薦 Email
+    # 09:05 進場避免抓到前日收盤價；13:20 執行三條件賣出判斷；14:00 寄出推薦 Email
     if   now.hour <= 9:    slot = "09:05"
     elif now.hour == 10:   slot = "10:00"
     elif now.hour == 11:   slot = "11:00"
@@ -857,33 +1052,29 @@ def sim_update(results, allow_entry=True):
                         pass
         print(f"    [持倉現價] 成功取得 {len(slot_price_map)}/{len(all_open_codes)} 檔現價")
 
-    # ── 1. 出場：13:20 時段判斷收盤價是否跌破5日均線，是則賣出 ──
-    ma5_break_exits = []   # 本次因跌破5MA而出場的記錄，供 main() 寄通知信
+    # ── 1. 出場：13:20 時段判斷三項賣出訊號，任一觸發即賣出 ──
+    sell_signal_exits = []   # 本次觸發賣出的記錄，供 main() 寄通知信
     still_open = []
 
-    # 只在 13:20 時段進行5MA跌破判斷（盤中偏早，收盤前現價最穩定）
-    if slot == "13:20":
-        # 批次為持倉股補抓 ma5（若當次掃描未涵蓋）
-        ma5_cache = {}
-        for pos in sim["open"]:
-            code = pos["code"]
-            scan_ma5 = (price_map.get(code) or {}).get("ma5")
-            if scan_ma5:
-                ma5_cache[code] = scan_ma5
-        missing_ma5 = [pos["code"] for pos in sim["open"] if pos["code"] not in ma5_cache]
-        if missing_ma5:
-            _mkt_map2 = {pos["code"]: pos.get("market", "上市") for pos in sim["open"]}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(missing_ma5))) as pool:
-                futs2 = {pool.submit(_fetch_ma5, c, _mkt_map2.get(c, "上市")): c for c in missing_ma5}
-                for fut2 in concurrent.futures.as_completed(futs2):
-                    try:
-                        c2 = futs2[fut2]
-                        v2 = fut2.result()
-                        if v2:
-                            ma5_cache[c2] = v2
-                    except Exception:
-                        pass
-        print(f"    [5MA判斷] 已取得 {len(ma5_cache)}/{len(sim['open'])} 檔均線")
+    # 只在 13:20 時段批次抓取賣出訊號所需資料
+    sell_data_cache = {}
+    if slot == "13:20" and sim["open"]:
+        _mkt_map2 = {pos["code"]: pos.get("market", "上市") for pos in sim["open"]}
+        open_codes = list(_mkt_map2.keys())
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(open_codes))) as pool:
+            futs2 = {
+                pool.submit(_fetch_sell_data, c, _mkt_map2[c]): c
+                for c in open_codes
+            }
+            for fut2 in concurrent.futures.as_completed(futs2):
+                try:
+                    c2 = futs2[fut2]
+                    v2 = fut2.result()
+                    if v2:
+                        sell_data_cache[c2] = v2
+                except Exception:
+                    pass
+        print(f"    [賣出訊號] 已取得 {len(sell_data_cache)}/{len(sim['open'])} 檔資料")
 
     for pos in sim["open"]:
         days_held = _trading_days_between(pos["entry_date"], today)
@@ -892,15 +1083,12 @@ def sim_update(results, allow_entry=True):
                       or pos["entry_price"])
         ret_pct = round((curr_price - pos["entry_price"]) / pos["entry_price"] * 100, 2)
 
-        # 跌破5MA出場（只在13:20判斷）
-        broke_5ma = False
-        ma5_val = None
+        # 三條件賣出判斷（只在13:20執行）
+        sell_reasons = []
         if slot == "13:20":
-            ma5_val = ma5_cache.get(pos["code"])
-            if ma5_val and curr_price < ma5_val:
-                broke_5ma = True
+            sell_reasons = _check_sell_signals(sell_data_cache.get(pos["code"]), curr_price)
 
-        if broke_5ma:
+        if sell_reasons:
             exit_rec = {
                 **{k: v for k, v in pos.items() if k not in ("curr_price", "curr_pct")},
                 "exit_date":   today,
@@ -908,11 +1096,11 @@ def sim_update(results, allow_entry=True):
                 "exit_price":  curr_price,
                 "return_pct":  ret_pct,
                 "days_held":   days_held,
-                "exit_reason": "5MA_break",
-                "ma5_at_exit": ma5_val,
+                "exit_reason": sell_reasons[0].split("(")[0],  # 主要原因（不含細節）
+                "sell_detail": " + ".join(sell_reasons),
             }
             sim["closed"].append(exit_rec)
-            ma5_break_exits.append(exit_rec)
+            sell_signal_exits.append(exit_rec)
         else:
             pos["curr_price"] = curr_price
             pos["curr_pct"]   = ret_pct
@@ -920,7 +1108,7 @@ def sim_update(results, allow_entry=True):
             still_open.append(pos)
 
     sim["open"] = still_open
-    sim["last_5ma_exits"] = ma5_break_exits  # 供 main() 讀取後寄通知信
+    sim["last_sell_exits"] = sell_signal_exits  # 供 main() 讀取後寄通知信
 
     # ── 2. 新進場：只在排程觸發時開倉（手動執行跳過） ──
     new_count = 0
@@ -1219,7 +1407,7 @@ function _simSort(tblId, col) {
 </script>"""
 
     wrap_open  = '<div style="margin:12px 0;background:#fff;border:1px solid #b8c8d8;border-radius:6px;padding:10px 14px">' if for_email else '<details open style="margin:12px 0;background:#fff;border:1px solid #b8c8d8;border-radius:6px;padding:10px 14px">'
-    wrap_title = '' if for_email else f'<summary style="font-weight:bold;color:#1a5276;font-size:1em;cursor:pointer">模擬下單 — 5時段進場比較（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} / 量增≥{SIM_VOL_RATIO_MIN}x / 跳過{"/".join(SIM_SKIP_SLOTS)} / 跌破5MA出場）</summary>'
+    wrap_title = '' if for_email else f'<summary style="font-weight:bold;color:#1a5276;font-size:1em;cursor:pointer">模擬下單 — 5時段進場比較（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} / 量增≥{SIM_VOL_RATIO_MIN}x / 跳過{"/".join(SIM_SKIP_SLOTS)} / 爆量滯漲+避雷針+大黑K出場）</summary>'
     wrap_close = '</div>' if for_email else '</details>'
     sort_hint  = "" if for_email else "（點欄位標題可排序）"
     closed_label = "已出場明細（全部）" if for_email else "已出場明細（全部，點欄位標題可排序）"
@@ -1393,6 +1581,22 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
         mark = "**" if flag else ""
         return f'<td style="color:{col};font-weight:{"bold" if flag else "normal"}">{mark}{net:+,}{mark}</td>'
 
+    def retro_td_web(r):
+        lvl = r.get("retro_level", "none")
+        sig = r.get("retro_signal", "—")
+        pat = r.get("retro_pattern", "")
+        if lvl == "gold":
+            bg, fg = "#f57c00", "#fff"
+        elif lvl == "today":
+            bg, fg = "#2e7d32", "#fff"
+        elif lvl == "retest":
+            bg, fg = "#1565c0", "#fff"
+        else:
+            return f'<td style="color:#bbb;font-size:.85em">—</td>'
+        pat_html = f'<br><span style="font-size:.7em;color:#888">{pat}</span>' if pat else ""
+        return (f'<td style="background:{bg};color:{fg};font-size:.78em;font-weight:bold;'
+                f'white-space:nowrap;padding:4px 6px">{sig}{pat_html}</td>')
+
     def _build_rows(stock_list):
         _rows = ""
         for i, r in enumerate(stock_list, 1):
@@ -1438,11 +1642,39 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
               <span style="font-size:.75em;color:#666">{r['h_signals']}</span></td>
           <td>{badge(r['combined'])}{diff_str(code,'combined',r['combined'])}{entry_tag}</td>
           <td style="font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
+          {retro_td_web(r)}
         </tr>"""
         return _rows
 
     rows_twse = _build_rows(top_twse)
     rows_tpex = _build_rows(top_tpex)
+
+    # 🎯 Web 版回塑性訊號摘要
+    _gold = [r for r in (top_twse + top_tpex) if r.get("retro_level") == "gold"]
+    _today = [r for r in (top_twse + top_tpex) if r.get("retro_level") == "today"]
+    if _gold or _today:
+        _gold_rows = ""
+        for r in _gold + _today:
+            tag = "🏆" if r.get("retro_level") == "gold" else "✓"
+            _gold_rows += (
+                f'<tr><td style="padding:5px 8px;border:1px solid #ffd180;font-weight:bold">{tag} {r["code"]}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffd180">{r["name"]}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffd180;font-size:.85em">{r.get("retro_signal","")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffd180;font-size:.85em">{r.get("retro_pattern","")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffd180;color:#c0392b">${r.get("retro_price","-")}</td></tr>')
+        retro_summary_web = (
+            f'<div style="background:#fff8e1;border:2px solid #f57c00;border-radius:6px;'
+            f'padding:12px;margin:10px 0">'
+            f'<b style="color:#e65100;font-size:1.05em">🎯 回塑性訊號摘要</b>'
+            f'<span style="color:#666;font-size:.85em">（黃金 {len(_gold)} 檔 / 今日訊號 {len(_today)} 檔）</span>'
+            f'<table style="border-collapse:collapse;width:100%;margin-top:8px;background:#fff">'
+            f'<thead><tr style="background:#f57c00;color:#fff">'
+            f'<th style="padding:5px 8px">代號</th><th style="padding:5px 8px">名稱</th>'
+            f'<th style="padding:5px 8px">觸發訊號</th><th style="padding:5px 8px">起漲前型態</th>'
+            f'<th style="padding:5px 8px">建議買價</th>'
+            f'</tr></thead><tbody>{_gold_rows}</tbody></table></div>')
+    else:
+        retro_summary_web = ""
 
     mstr = ('<span style="color:#28a745;font-weight:bold">● 盤中</span>'
             if market_open else '<span style="color:#aaa">● 收盤</span>')
@@ -1493,6 +1725,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <span style="color:#2ca02c;font-weight:bold">▼下降</span>
   <span style="background:#eafaf1;border:1px solid #27ae60;border-left:4px solid #27ae60;padding:3px 8px;border-radius:3px;font-size:.82em">綠底＝符合進場條件（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} 且量增≥{SIM_VOL_RATIO_MIN}x）</span>
 </div>
+{retro_summary_web}
 <h2 style="color:#003366;margin:14px 0 6px;font-size:1em;border-left:4px solid #003366;padding-left:8px">▶ 上市推薦股（前 {TOP_N} 名）</h2>
 <table>
 <thead>
@@ -1500,7 +1733,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th>
 </tr>
 </thead>
 <tbody>{rows_twse}</tbody>
@@ -1512,7 +1745,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th>
 </tr>
 </thead>
 <tbody>{rows_tpex}</tbody>
@@ -1604,6 +1837,22 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
         return (f'<a href="{tv}" style="{s};background:#1565c0">TV</a>'
                 f'<a href="{gi}" style="{s};background:#2e7d32">K線</a>')
 
+    def retro_td_email(r):
+        lvl = r.get("retro_level", "none")
+        sig = r.get("retro_signal", "—")
+        pat = r.get("retro_pattern", "")
+        if lvl == "gold":
+            bg, fg = "#f57c00", "#fff"
+        elif lvl == "today":
+            bg, fg = "#2e7d32", "#fff"
+        elif lvl == "retest":
+            bg, fg = "#1565c0", "#fff"
+        else:
+            return f'<td style="{td};color:#bbb">—</td>'
+        pat_html = f'<br><span style="font-size:.7em;color:#fff;opacity:.85">{pat}</span>' if pat else ""
+        return (f'<td style="{td};background:{bg};color:{fg};font-weight:bold;'
+                f'font-size:.78em;white-space:nowrap">{sig}{pat_html}</td>')
+
     def _build_email_rows(stock_list):
         _rows = ""
         for i, r in enumerate(stock_list, 1):
@@ -1646,11 +1895,40 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
           <td style="{td}">{badge_cell(r['h_score'],55,35)}<br><span style="font-size:.78em;color:#666">{r['h_signals']}</span></td>
           <td style="{td}">{badge_cell(r['combined'])}{entry_tag}</td>
           <td style="{td};font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
+          {retro_td_email(r)}
         </tr>"""
         return _rows
 
     rows_twse = _build_email_rows(top_twse)
     rows_tpex = _build_email_rows(top_tpex)
+
+    # 🏆 黃金訊號摘要（W底/V反 + 規則觸發）
+    gold_list = [r for r in (top_twse + top_tpex) if r.get("retro_level") == "gold"]
+    today_list = [r for r in (top_twse + top_tpex) if r.get("retro_level") == "today"]
+    if gold_list or today_list:
+        gold_rows = ""
+        for r in gold_list + today_list:
+            tag = "🏆" if r.get("retro_level") == "gold" else "✓"
+            gold_rows += (f'<tr><td style="padding:5px 8px;border:1px solid #ffd180;font-weight:bold">{tag} {r["code"]}</td>'
+                          f'<td style="padding:5px 8px;border:1px solid #ffd180">{r["name"]}</td>'
+                          f'<td style="padding:5px 8px;border:1px solid #ffd180;font-size:.85em">{r.get("retro_signal","")}</td>'
+                          f'<td style="padding:5px 8px;border:1px solid #ffd180;font-size:.85em">{r.get("retro_pattern","")}</td>'
+                          f'<td style="padding:5px 8px;border:1px solid #ffd180;color:#c0392b">${r.get("retro_price","-")}</td></tr>')
+        retro_summary = f"""
+    <div style="background:#fff8e1;border:2px solid #f57c00;border-radius:6px;padding:12px;margin-bottom:14px">
+      <b style="color:#e65100;font-size:1.05em">🎯 回塑性訊號摘要</b>
+      <span style="color:#666;font-size:.85em">（黃金 {len(gold_list)} 檔 / 今日訊號 {len(today_list)} 檔）</span>
+      <table style="border-collapse:collapse;width:100%;margin-top:8px;background:#fff">
+      <thead><tr style="background:#f57c00;color:#fff">
+        <th style="padding:5px 8px">代號</th><th style="padding:5px 8px">名稱</th>
+        <th style="padding:5px 8px">觸發訊號</th><th style="padding:5px 8px">起漲前型態</th>
+        <th style="padding:5px 8px">建議買價</th>
+      </tr></thead>
+      <tbody>{gold_rows}</tbody>
+      </table>
+    </div>"""
+    else:
+        retro_summary = ""
 
     th = "padding:7px 8px;border:1px solid #1a3a6e;background:#003366;color:#fff;white-space:nowrap"
     if sim is not None:
@@ -1691,7 +1969,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
   <th style="{th}">RSI</th><th style="{th}">KD</th>
   <th style="{th}">月營收YoY</th>
   <th style="{th}">日線(波段)</th><th style="{th}">60分線(短線)</th>
-  <th style="{th}">綜合分</th><th style="{th}">⚑整理</th>
+  <th style="{th}">綜合分</th><th style="{th}">⚑整理</th><th style="{th}">🎯回塑訊號</th>
 </tr></thead>"""
     return f"""<html>
 <head><meta charset="UTF-8"></head>
@@ -1699,6 +1977,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
 <div style="max-width:1100px;margin:0 auto">
 <h2 style="color:#003366;margin-bottom:4px">台股選股推薦 {today_str} {run_time_str} [{mstr}]</h2>
 {alert_section}
+{retro_summary}
 <p style="{_sec_title}">▶ 上市推薦股（前 {TOP_N} 名）</p>
 <p style="color:#666;font-size:.88em;margin:4px 0 10px">
   上市分析{sum(1 for r in results if r.get('market','上市')=='上市')}檔 &nbsp;|&nbsp;
@@ -1779,44 +2058,46 @@ def send_email(cfg, results, html_path, today_str, run_time_str, market_open, si
         print(f"    [警告] email 寄送失敗: {e}")
 
 
-def send_5ma_break_email(cfg, exits, today_str, run_time_str):
-    """寄出跌破5日均線賣出通知信"""
+def send_sell_signal_email(cfg, exits, today_str, run_time_str):
+    """寄出賣出訊號通知信（爆量滯漲/避雷針/大黑K）"""
     try:
         sender    = cfg["sender_email"]
         password  = cfg["sender_app_password"]
         receivers = _parse_recipients(cfg.get("recipient_email", "wic0935@gmail.com"))
 
-        subject = f"[台股] 跌破5日均線賣出通知 {today_str} {run_time_str}"
+        subject = f"[台股] 賣出訊號通知 {today_str} {run_time_str}"
 
         rows_html = ""
         for p in exits:
             ret = p.get("return_pct", 0)
             ret_color = "#c0392b" if ret < 0 else "#27ae60"
+            detail = p.get("sell_detail") or p.get("exit_reason", "")
             rows_html += f"""
 <tr>
   <td style="padding:6px 10px;border:1px solid #ddd">{p.get('name','')}</td>
   <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{p.get('code','')}</td>
   <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{p.get('entry_date','')}</td>
   <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('entry_price','')}</td>
-  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('exit_price','')}</td>
-  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right">{p.get('ma5_at_exit','')}</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;text-align:right;font-weight:bold">{p.get('exit_price','')}</td>
   <td style="padding:6px 10px;border:1px solid #ddd;text-align:right;color:{ret_color};font-weight:bold">{ret:+.2f}%</td>
+  <td style="padding:6px 10px;border:1px solid #ddd;color:#8e44ad">{detail}</td>
   <td style="padding:6px 10px;border:1px solid #ddd;text-align:center">{today_str} {run_time_str}</td>
 </tr>"""
 
         body = f"""<html><body style="font-family:Arial,sans-serif;font-size:14px">
-<h2 style="color:#c0392b">⚠️ 跌破5日均線賣出通知</h2>
-<p>以下持倉於 {today_str} {run_time_str} 因收盤價跌破5日均線，已自動賣出：</p>
+<h2 style="color:#c0392b">⚠️ 賣出訊號通知</h2>
+<p>以下持倉於 {today_str} {run_time_str} 觸發賣出條件，已自動賣出：</p>
+<p style="font-size:.85em;color:#555">觸發條件：①爆量滯漲（量&gt;2.5x均量且漲幅&lt;1%）　②避雷針（上影&gt;2x實體且正乖離&gt;10%）　③大黑K（跌幅&gt;4%且跌破5MA）</p>
 <table style="border-collapse:collapse;width:100%">
 <thead><tr style="background:#1a5276;color:#fff">
   <th style="padding:7px 10px;border:1px solid #1a5276">股票名稱</th>
   <th style="padding:7px 10px;border:1px solid #1a5276">代號</th>
   <th style="padding:7px 10px;border:1px solid #1a5276">買入日期</th>
   <th style="padding:7px 10px;border:1px solid #1a5276">買入價格</th>
-  <th style="padding:7px 10px;border:1px solid #1a5276">今日收盤價</th>
-  <th style="padding:7px 10px;border:1px solid #1a5276">5日均線</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">賣出價格</th>
   <th style="padding:7px 10px;border:1px solid #1a5276">報酬率</th>
-  <th style="padding:7px 10px;border:1px solid #1a5276">賣出日期及時間</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">觸發原因</th>
+  <th style="padding:7px 10px;border:1px solid #1a5276">賣出時間</th>
 </tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
@@ -1832,13 +2113,13 @@ def send_5ma_break_email(cfg, exits, today_str, run_time_str):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
             s.login(sender, password)
             s.send_message(msg)
-        print(f"    [5MA賣出通知] email 已寄出 -> {', '.join(receivers)}")
+        print(f"    [賣出通知] email 已寄出 -> {', '.join(receivers)}")
     except Exception as e:
-        print(f"    [警告] 5MA賣出通知 email 失敗: {e}")
+        print(f"    [警告] 賣出通知 email 失敗: {e}")
 
 
-def send_telegram_5ma_break(cfg, exits, today_str, run_time_str):
-    """發送跌破5日均線賣出通知到 Telegram"""
+def send_telegram_sell_signal(cfg, exits, today_str, run_time_str):
+    """發送賣出訊號通知到 Telegram"""
     import urllib.request, urllib.parse, ssl as _ssl
 
     bots = cfg.get("telegram_bots") or []
@@ -1854,14 +2135,15 @@ def send_telegram_5ma_break(cfg, exits, today_str, run_time_str):
     _ctx.check_hostname = False
     _ctx.verify_mode = _ssl.CERT_NONE
 
-    lines = [f"⚠️ 跌破5MA賣出通知 {today_str} {run_time_str}"]
+    lines = [f"⚠️ 賣出訊號通知 {today_str} {run_time_str}"]
     for p in exits:
-        ret = p.get("return_pct", 0)
-        sign = "+" if ret >= 0 else ""
+        ret    = p.get("return_pct", 0)
+        sign   = "+" if ret >= 0 else ""
+        detail = p.get("sell_detail") or p.get("exit_reason", "")
         lines.append(
             f"  {p.get('code','')} {p.get('name','')}  "
-            f"買:{p.get('entry_price','')} 出:{p.get('exit_price','')} "
-            f"5MA:{p.get('ma5_at_exit','')}  {sign}{ret:.2f}%"
+            f"買:{p.get('entry_price','')} 出:{p.get('exit_price','')}  "
+            f"{sign}{ret:.2f}%  [{detail}]"
         )
     text = "\n".join(lines)
 
@@ -1875,9 +2157,9 @@ def send_telegram_5ma_break(cfg, exits, today_str, run_time_str):
             urllib.request.urlopen(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 data=data, timeout=15, context=_ctx)
-            print(f"    [5MA賣出通知] TG bot {chat_id} 已發送")
+            print(f"    [賣出通知] TG bot {chat_id} 已發送")
         except Exception as e:
-            print(f"    [警告] 5MA賣出通知 TG 失敗: {e}")
+            print(f"    [警告] 賣出通知 TG 失敗: {e}")
 
 
 def send_telegram(cfg, results, html_path, today_str, run_time_str):
@@ -2199,15 +2481,15 @@ def main():
 
     cfg = load_email_cfg()
 
-    # ── 13:20：寄出跌破5MA賣出通知（如有） ──────────────
+    # ── 13:20：寄出賣出訊號通知（如有） ──────────────────
     if now.hour == 13 and cfg:
-        ma5_exits = sim.get("last_5ma_exits", [])
-        if ma5_exits:
-            print(f"    [5MA賣出] 本次共 {len(ma5_exits)} 檔跌破5MA，寄出通知...")
-            send_5ma_break_email(cfg, ma5_exits, today_str, run_time_str)
-            send_telegram_5ma_break(cfg, ma5_exits, today_str, run_time_str)
+        sell_exits = sim.get("last_sell_exits", [])
+        if sell_exits:
+            print(f"    [賣出訊號] 本次共 {len(sell_exits)} 檔觸發賣出，寄出通知...")
+            send_sell_signal_email(cfg, sell_exits, today_str, run_time_str)
+            send_telegram_sell_signal(cfg, sell_exits, today_str, run_time_str)
         else:
-            print("    [5MA賣出] 本次無持倉跌破5日均線")
+            print("    [賣出訊號] 本次無持倉觸發賣出條件")
 
     # ── 每次排程：寄出選股推薦 Email + Telegram ─────────
     if is_scheduled and cfg:
