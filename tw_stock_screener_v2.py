@@ -703,6 +703,93 @@ def _retro_check(df):
 
 
 # ─────────────────────────────────────────────
+# 飆股型態 DNA 4 條件相似度（從 11 張範本萃取；2026-05-13 移除 A 橫盤條件）
+#   B. 量縮乾枯：近 5 日均量 < 60 日均量 × 0.8
+#   C. 突破首棒：紅K > 4% + 量 > 20MA量 × 2 + 收盤站上 5/10/20MA（近 3 日內）
+#   D. KD 強勢未過熱：今日 K > D 且 K < 60
+#   E. 60MA 斜率 ≥ 0：60MA 今日 ≥ 5 日前
+# 註：A 條件（底部橫盤<8%）與 11 張範本實況衝突 — 範本本身已飆過，過去 20 日波動率自然偏大
+# ─────────────────────────────────────────────
+def _breakout_check(df):
+    """回傳 {pct, pass:{B,C,D,E}, reason}"""
+    try:
+        if df is None or len(df) < 65:
+            return {"pct": 0, "pass": {k: False for k in "BCDE"}, "reason": "資料不足"}
+        close  = df["Close"].astype(float).values
+        open_  = df["Open"].astype(float).values
+        high   = df["High"].astype(float).values
+        low    = df["Low"].astype(float).values
+        volume = df["Volume"].astype(float).values
+        n = len(close)
+
+        cs = pd.Series(close)
+        ma5  = cs.rolling(5).mean().values
+        ma10 = cs.rolling(10).mean().values
+        ma20 = cs.rolling(20).mean().values
+        ma60 = cs.rolling(60).mean().values
+        vma5  = pd.Series(volume).rolling(5).mean().values
+        vma20 = pd.Series(volume).rolling(20).mean().values
+        vma60 = pd.Series(volume).rolling(60).mean().values
+        lo9 = pd.Series(low).rolling(9).min().values
+        hi9 = pd.Series(high).rolling(9).max().values
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rsv = np.where(hi9 - lo9 > 0, (close - lo9) / (hi9 - lo9) * 100, 50.0)
+        rsv = np.nan_to_num(rsv, nan=50.0)
+        k = np.zeros(n); d = np.zeros(n); k[0] = 50.0; d[0] = 50.0
+        for i in range(1, n):
+            k[i] = (2/3) * k[i-1] + (1/3) * float(rsv[i])
+            d[i] = (2/3) * d[i-1] + (1/3) * k[i]
+
+        i = n - 1
+        reasons = []
+        passed = {"B": False, "C": False, "D": False, "E": False}
+
+        # C. 近 3 日內是否有「突破首棒」
+        bk_idx = None
+        for j in range(max(0, i - 2), i + 1):
+            if j < 20 or np.isnan(ma5[j]) or np.isnan(ma10[j]) or np.isnan(ma20[j]) or np.isnan(vma20[j]):
+                continue
+            if open_[j] <= 0:
+                continue
+            red_pct = (close[j] - open_[j]) / open_[j] * 100
+            stand_all = (close[j] > ma5[j]) and (close[j] > ma10[j]) and (close[j] > ma20[j])
+            if red_pct > 4.0 and volume[j] > vma20[j] * 2.0 and stand_all:
+                bk_idx = j
+                break
+        passed["C"] = bk_idx is not None
+        ref_idx = bk_idx if bk_idx is not None else i
+
+        # B. 量縮乾枯
+        b_idx = max(0, ref_idx - 1)
+        if (b_idx < n and not np.isnan(vma5[b_idx]) and not np.isnan(vma60[b_idx])
+                and vma60[b_idx] > 0):
+            ratio = vma5[b_idx] / vma60[b_idx]
+            passed["B"] = ratio < 0.8
+            if not passed["B"]:
+                reasons.append(f"量縮{ratio:.2f}×")
+        # C 之未過原因
+        if not passed["C"]:
+            reasons.append("無突破K")
+        # D. 今日 K > D 且 K < 60
+        passed["D"] = bool(k[i] > d[i] and k[i] < 60)
+        if not passed["D"]:
+            if k[i] >= 60:
+                reasons.append(f"KD過熱({k[i]:.0f})")
+            else:
+                reasons.append("KD未交叉")
+        # E. 60MA 斜率 ≥ 0
+        if i >= 5 and not np.isnan(ma60[i]) and not np.isnan(ma60[i-5]):
+            passed["E"] = ma60[i] >= ma60[i-5]
+            if not passed["E"]:
+                reasons.append("60MA向下")
+
+        pct = sum(25 for v in passed.values() if v)
+        return {"pct": pct, "pass": passed, "reason": " / ".join(reasons[:2]) if reasons else ""}
+    except Exception:
+        return {"pct": 0, "pass": {k: False for k in "BCDE"}, "reason": "計算異常"}
+
+
+# ─────────────────────────────────────────────
 # 下載評分：日線 + 60分線
 # ─────────────────────────────────────────────
 def _fetch_daily_only(args):
@@ -730,6 +817,7 @@ def _fetch_daily(code, name, sector, market="上市"):
         mchg  = (ind["c"]-close.iloc[-22])/close.iloc[-22]*100 if len(close)>=22 else 0
         day_chg = round((ind["c"] - ind["c1"]) / ind["c1"] * 100, 2) if ind["c1"] > 0 else 0
         retro = _retro_check(df)
+        bp = _breakout_check(df)
         return dict(
             code=code, name=name, sector=sector, market=market,
             price=round(float(ind["c"]),2),
@@ -753,6 +841,7 @@ def _fetch_daily(code, name, sector, market="上市"):
             foreign_flag=False, trust_flag=False,
             retro_signal=retro["signal"], retro_price=retro["price"],
             retro_pattern=retro["pattern"], retro_level=retro["level"],
+            bp_pct=bp["pct"], bp_pass=bp["pass"], bp_reason=bp["reason"],
         )
     except:
         return None
@@ -1597,6 +1686,32 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
         return (f'<td style="background:{bg};color:{fg};font-size:.78em;font-weight:bold;'
                 f'white-space:nowrap;padding:4px 6px">{sig}{pat_html}</td>')
 
+    def breakout_td_web(r):
+        pct = int(r.get("bp_pct", 0) or 0)
+        pf = r.get("bp_pass", {}) or {}
+        rsn = r.get("bp_reason", "") or ""
+        if pct >= 100:
+            bg, fg, tag = "#c0392b", "#fff", "🏆 100%"
+        elif pct >= 75:
+            bg, fg, tag = "#e67e22", "#fff", f"✓ {pct}%"
+        elif pct >= 50:
+            bg, fg, tag = "#f39c12", "#fff", f"⚠ {pct}%"
+        elif pct >= 25:
+            bg, fg, tag = "#95a5a6", "#fff", f"{pct}%"
+        else:
+            return '<td style="color:#bbb;font-size:.85em;text-align:center">—</td>'
+        marks = "".join(
+            f'<span style="color:{"#27ae60" if pf.get(k) else "#c0392b"};opacity:{1 if pf.get(k) else 0.5}">'
+            f'{k}{"✓" if pf.get(k) else "✗"}</span> '
+            for k in "BCDE"
+        )
+        rsn_html = f'<div style="font-size:.7em;color:#666;margin-top:2px">{rsn}</div>' if rsn else ""
+        return (f'<td style="text-align:center;background:#fff3e0;padding:4px 6px">'
+                f'<span style="background:{bg};color:{fg};font-weight:bold;'
+                f'padding:3px 8px;border-radius:4px;font-size:.85em">{tag}</span>'
+                f'<div style="font-size:.7em;letter-spacing:1px;margin-top:3px">{marks}</div>'
+                f'{rsn_html}</td>')
+
     def _build_rows(stock_list):
         _rows = ""
         for i, r in enumerate(stock_list, 1):
@@ -1643,6 +1758,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
           <td>{badge(r['combined'])}{diff_str(code,'combined',r['combined'])}{entry_tag}</td>
           <td style="font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
           {retro_td_web(r)}
+          {breakout_td_web(r)}
         </tr>"""
         return _rows
 
@@ -1675,6 +1791,75 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
             f'</tr></thead><tbody>{_gold_rows}</tbody></table></div>')
     else:
         retro_summary_web = ""
+
+    # 📊 飆股 DNA 候選名單（全市場 bp_pct ≥ 75）
+    bp_candidates = sorted(
+        [r for r in results if int(r.get("bp_pct", 0) or 0) >= 75],
+        key=lambda r: (-int(r.get("bp_pct", 0) or 0), -int(r.get("combined", 0) or 0))
+    )
+    if bp_candidates:
+        _bp_rows = ""
+        _cnt100 = sum(1 for r in bp_candidates if int(r.get("bp_pct", 0)) >= 100)
+        _cnt75  = sum(1 for r in bp_candidates if int(r.get("bp_pct", 0)) == 75)
+        for r in bp_candidates[:30]:
+            pct = int(r.get("bp_pct", 0))
+            pf  = r.get("bp_pass", {}) or {}
+            rsn = r.get("bp_reason", "") or ""
+            mkt = r.get("market", "上市")
+            ex  = "TWSE" if mkt == "上市" else "TPEX"
+            if pct >= 100:
+                bg, tag = "#c0392b", "🏆 100%"
+            else:
+                bg, tag = "#e67e22", f"✓ {pct}%"
+            mrk = "".join(
+                f'<span style="color:{"#27ae60" if pf.get(k) else "#c0392b"};opacity:{1 if pf.get(k) else 0.4};margin-right:2px">'
+                f'{k}{"✓" if pf.get(k) else "✗"}</span>'
+                for k in "BCDE"
+            )
+            _bp_rows += (
+                f'<tr>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-weight:bold">'
+                f'<a href="https://www.tradingview.com/chart/?symbol={ex}%3A{r["code"]}" target="_blank" '
+                f'style="color:#003366;text-decoration:none">{r["code"]}</a></td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">{r["name"]}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.82em;color:#555">{r.get("sector","")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-weight:bold">{r.get("price","-")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">'
+                f'<span style="background:{bg};color:#fff;padding:2px 8px;border-radius:4px;font-weight:bold;font-size:.85em">{tag}</span></td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.85em;letter-spacing:1px">{mrk}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.78em;color:#888">{rsn}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">'
+                f'<span style="background:#28a745;color:#fff;padding:1px 6px;border-radius:3px;font-size:.82em">{r.get("combined", 0)}</span></td>'
+                f'</tr>'
+            )
+        breakout_summary_web = (
+            f'<div style="background:#fff3e0;border:2px solid #e65100;border-radius:6px;'
+            f'padding:12px;margin:10px 0">'
+            f'<b style="color:#bf360c;font-size:1.05em">📊 飆股 DNA 候選名單（全市場相似度 ≥ 75%）</b>'
+            f'<span style="color:#666;font-size:.85em">'
+            f'（🏆 100% {_cnt100} 檔 / ✓ 75% {_cnt75} 檔'
+            f'{f"，顯示前 30 名" if len(bp_candidates) > 30 else ""}）</span>'
+            f'<table style="border-collapse:collapse;width:100%;margin-top:8px;background:#fff">'
+            f'<thead><tr style="background:#e65100;color:#fff">'
+            f'<th style="padding:5px 8px">代號</th>'
+            f'<th style="padding:5px 8px">名稱</th>'
+            f'<th style="padding:5px 8px">類股</th>'
+            f'<th style="padding:5px 8px">現價</th>'
+            f'<th style="padding:5px 8px">DNA%</th>'
+            f'<th style="padding:5px 8px">BCDE</th>'
+            f'<th style="padding:5px 8px">未通過原因</th>'
+            f'<th style="padding:5px 8px">綜合分</th>'
+            f'</tr></thead><tbody>{_bp_rows}</tbody></table>'
+            f'<div style="font-size:.78em;color:#666;margin-top:6px">'
+            f'B=量縮&lt;0.8× &nbsp; C=突破首棒(紅K&gt;4%+量&gt;2×+站5/10/20MA) &nbsp; '
+            f'D=KD強勢(K&gt;D&K&lt;60) &nbsp; E=60MA向上</div></div>'
+        )
+    else:
+        breakout_summary_web = (
+            f'<div style="background:#fafafa;border:1px dashed #bdbdbd;border-radius:6px;'
+            f'padding:10px 14px;margin:10px 0;font-size:.88em;color:#888">'
+            f'📊 飆股 DNA 候選名單：目前全市場無 ≥ 75% 標的</div>'
+        )
 
     mstr = ('<span style="color:#28a745;font-weight:bold">● 盤中</span>'
             if market_open else '<span style="color:#aaa">● 收盤</span>')
@@ -1726,6 +1911,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <span style="background:#eafaf1;border:1px solid #27ae60;border-left:4px solid #27ae60;padding:3px 8px;border-radius:3px;font-size:.82em">綠底＝符合進場條件（分數{SIM_ENTRY_SCORE}~{SIM_MAX_SCORE} 且量增≥{SIM_VOL_RATIO_MIN}x）</span>
 </div>
 {retro_summary_web}
+{breakout_summary_web}
 <h2 style="color:#003366;margin:14px 0 6px;font-size:1em;border-left:4px solid #003366;padding-left:8px">▶ 上市推薦股（前 {TOP_N} 名）</h2>
 <table>
 <thead>
@@ -1733,7 +1919,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th><th>📊飆股型態%</th>
 </tr>
 </thead>
 <tbody>{rows_twse}</tbody>
@@ -1745,7 +1931,7 @@ def generate_html(results, prev_map, today_str, market_open, run_time_str, sim=N
   <th>#</th><th>執行時間</th><th>代號</th><th>名稱</th><th>類股</th><th>股價</th>
   <th>今日</th><th>週漲幅</th><th>月漲幅</th><th>RSI</th><th>KD</th>
   <th>月營收YoY</th><th>今日量(張)</th><th>外資(張)</th><th>投信(張)</th>
-  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th>
+  <th>日線(波段)</th><th>60分線(短線)</th><th>綜合分</th><th>⚑整理</th><th>🎯回塑訊號</th><th>📊飆股型態%</th>
 </tr>
 </thead>
 <tbody>{rows_tpex}</tbody>
@@ -1853,6 +2039,32 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
         return (f'<td style="{td};background:{bg};color:{fg};font-weight:bold;'
                 f'font-size:.78em;white-space:nowrap">{sig}{pat_html}</td>')
 
+    def breakout_td_email(r):
+        pct = int(r.get("bp_pct", 0) or 0)
+        pf = r.get("bp_pass", {}) or {}
+        rsn = r.get("bp_reason", "") or ""
+        if pct >= 100:
+            bg, fg, tag = "#c0392b", "#fff", "🏆 100%"
+        elif pct >= 75:
+            bg, fg, tag = "#e67e22", "#fff", f"✓ {pct}%"
+        elif pct >= 50:
+            bg, fg, tag = "#f39c12", "#fff", f"⚠ {pct}%"
+        elif pct >= 25:
+            bg, fg, tag = "#95a5a6", "#fff", f"{pct}%"
+        else:
+            return f'<td style="{td};color:#bbb">—</td>'
+        marks = "".join(
+            f'<span style="color:{"#27ae60" if pf.get(k) else "#999"}">'
+            f'{k}{"✓" if pf.get(k) else "✗"}</span> '
+            for k in "BCDE"
+        )
+        rsn_html = f'<br><span style="font-size:.7em;color:#666">{rsn}</span>' if rsn else ""
+        return (f'<td style="{td};background:#fff3e0">'
+                f'<span style="background:{bg};color:{fg};font-weight:bold;'
+                f'padding:2px 7px;border-radius:4px;font-size:.85em">{tag}</span>'
+                f'<br><span style="font-size:.7em;letter-spacing:1px">{marks}</span>'
+                f'{rsn_html}</td>')
+
     def _build_email_rows(stock_list):
         _rows = ""
         for i, r in enumerate(stock_list, 1):
@@ -1896,6 +2108,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
           <td style="{td}">{badge_cell(r['combined'])}{entry_tag}</td>
           <td style="{td};font-size:.8em;color:#e65100;white-space:nowrap">{'<b>⚑</b> ' + r.get('consol_signal','') if r.get('consol_flag') else '—'}</td>
           {retro_td_email(r)}
+          {breakout_td_email(r)}
         </tr>"""
         return _rows
 
@@ -1929,6 +2142,65 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
     </div>"""
     else:
         retro_summary = ""
+
+    # 📊 飆股 DNA 候選名單（Email 版，全市場 bp_pct ≥ 75）
+    bp_candidates_e = sorted(
+        [r for r in results if int(r.get("bp_pct", 0) or 0) >= 75],
+        key=lambda r: (-int(r.get("bp_pct", 0) or 0), -int(r.get("combined", 0) or 0))
+    )
+    if bp_candidates_e:
+        bp_rows_e = ""
+        c100 = sum(1 for r in bp_candidates_e if int(r.get("bp_pct", 0)) >= 100)
+        c75  = sum(1 for r in bp_candidates_e if int(r.get("bp_pct", 0)) == 75)
+        for r in bp_candidates_e[:30]:
+            pct = int(r.get("bp_pct", 0))
+            pf  = r.get("bp_pass", {}) or {}
+            rsn = r.get("bp_reason", "") or ""
+            if pct >= 100:
+                bg, tag = "#c0392b", "🏆 100%"
+            else:
+                bg, tag = "#e67e22", f"✓ {pct}%"
+            mrk = "".join(
+                f'<span style="color:{"#27ae60" if pf.get(k) else "#999"};margin-right:2px">'
+                f'{k}{"✓" if pf.get(k) else "✗"}</span>'
+                for k in "BCDE"
+            )
+            bp_rows_e += (
+                f'<tr><td style="padding:5px 8px;border:1px solid #ffcc80;font-weight:bold">{r["code"]}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">{r["name"]}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.82em;color:#555">{r.get("sector","")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-weight:bold">{r.get("price","-")}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">'
+                f'<span style="background:{bg};color:#fff;padding:2px 8px;border-radius:4px;font-weight:bold;font-size:.85em">{tag}</span></td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.85em;letter-spacing:1px">{mrk}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80;font-size:.78em;color:#888">{rsn}</td>'
+                f'<td style="padding:5px 8px;border:1px solid #ffcc80">'
+                f'<span style="background:#28a745;color:#fff;padding:1px 6px;border-radius:3px;font-size:.82em">{r.get("combined", 0)}</span></td>'
+                f'</tr>'
+            )
+        breakout_summary_e = f"""
+    <div style="background:#fff3e0;border:2px solid #e65100;border-radius:6px;padding:12px;margin-bottom:14px">
+      <b style="color:#bf360c;font-size:1.05em">📊 飆股 DNA 候選名單（全市場相似度 ≥ 75%）</b>
+      <span style="color:#666;font-size:.85em">（🏆 100% {c100} 檔 / ✓ 75% {c75} 檔{', 顯示前 30 名' if len(bp_candidates_e) > 30 else ''}）</span>
+      <table style="border-collapse:collapse;width:100%;margin-top:8px;background:#fff">
+      <thead><tr style="background:#e65100;color:#fff">
+        <th style="padding:5px 8px">代號</th><th style="padding:5px 8px">名稱</th>
+        <th style="padding:5px 8px">類股</th><th style="padding:5px 8px">現價</th>
+        <th style="padding:5px 8px">DNA%</th><th style="padding:5px 8px">BCDE</th>
+        <th style="padding:5px 8px">未通過原因</th><th style="padding:5px 8px">綜合分</th>
+      </tr></thead>
+      <tbody>{bp_rows_e}</tbody>
+      </table>
+      <div style="font-size:.78em;color:#666;margin-top:6px">
+        B=量縮&lt;0.8× &nbsp; C=突破首棒(紅K&gt;4%+量&gt;2×+站5/10/20MA) &nbsp; D=KD強勢(K&gt;D&K&lt;60) &nbsp; E=60MA向上
+      </div>
+    </div>"""
+    else:
+        breakout_summary_e = (
+            '<div style="background:#fafafa;border:1px dashed #bdbdbd;border-radius:6px;'
+            'padding:10px 14px;margin-bottom:14px;font-size:.88em;color:#888">'
+            '📊 飆股 DNA 候選名單：目前全市場無 ≥ 75% 標的</div>'
+        )
 
     th = "padding:7px 8px;border:1px solid #1a3a6e;background:#003366;color:#fff;white-space:nowrap"
     if sim is not None:
@@ -1969,7 +2241,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
   <th style="{th}">RSI</th><th style="{th}">KD</th>
   <th style="{th}">月營收YoY</th>
   <th style="{th}">日線(波段)</th><th style="{th}">60分線(短線)</th>
-  <th style="{th}">綜合分</th><th style="{th}">⚑整理</th><th style="{th}">🎯回塑訊號</th>
+  <th style="{th}">綜合分</th><th style="{th}">⚑整理</th><th style="{th}">🎯回塑訊號</th><th style="{th}">📊飆股型態%</th>
 </tr></thead>"""
     return f"""<html>
 <head><meta charset="UTF-8"></head>
@@ -1978,6 +2250,7 @@ def build_email_body(results, today_str, run_time_str, market_open, sim=None, bu
 <h2 style="color:#003366;margin-bottom:4px">台股選股推薦 {today_str} {run_time_str} [{mstr}]</h2>
 {alert_section}
 {retro_summary}
+{breakout_summary_e}
 <p style="{_sec_title}">▶ 上市推薦股（前 {TOP_N} 名）</p>
 <p style="color:#666;font-size:.88em;margin:4px 0 10px">
   上市分析{sum(1 for r in results if r.get('market','上市')=='上市')}檔 &nbsp;|&nbsp;
